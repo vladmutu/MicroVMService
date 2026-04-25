@@ -1,0 +1,44 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dynamic-analysis-postgres
+    environment:
+      POSTGRES_DB: dynamic_analysis
+      POSTGRES_USER: analysis
+      POSTGRES_PASSWORD: analysis
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  dynamic-analysis:
+    build: .
+    container_name: dynamic-analysis-service
+    privileged: true
+    ports:
+      - "8080:8080"
+    devices:
+      - "/dev/kvm:/dev/kvm"
+    tmpfs:
+      - /run
+      - /tmp
+    environment:
+      PROVIDER_NAME: sentinelflow-dynamic-analysis
+      ANALYSIS_TIMEOUT_SECONDS: 25
+      MAX_CONCURRENT_ANALYSES: 8
+      PACKAGE_DOWNLOAD_TIMEOUT_SECONDS: 15
+      PACKAGE_DOWNLOAD_MAX_BYTES: 52428800
+      FIRECRACKER_BINARY: /usr/local/bin/firecracker
+      JAILER_BINARY: /usr/local/bin/jailer
+      FIRECRACKER_DEFAULT_KERNEL: /opt/firecracker/vmlinux
+      FIRECRACKER_DEFAULT_ROOTFS: /opt/firecracker/rootfs.ext4
+      FIRECRACKER_CHROOT_BASE_DIR: /tmp/dynamic-analysis/jailer
+      POSTGRES_DSN: postgresql://analysis:analysis@postgres:5432/dynamic_analysis
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
