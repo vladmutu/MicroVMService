@@ -1,7 +1,15 @@
-from typing import Literal
+"""
+contracts.py — Pydantic v2 request/response models.
+
+POST /analyze is the single API surface for SentinelFlow integration.
+"""
+
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+
+# ── Request models ────────────────────────────────────────────────────
 
 class FirecrackerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -30,6 +38,8 @@ class AnalyzeRequest(BaseModel):
     artifact: ArtifactDescriptor | None = None
 
 
+# ── Response models ───────────────────────────────────────────────────
+
 class SyscallTrace(BaseModel):
     suspicious_count: int = Field(ge=0)
     categories: list[str]
@@ -45,17 +55,16 @@ class FilesystemChanges(BaseModel):
     paths: list[str]
 
 
-class JobLogEntry(BaseModel):
-    timestamp: str
-    source: Literal["host", "guest", "control", "stderr", "stdout"]
-    level: Literal["debug", "info", "warning", "error"]
-    message: str
-
-
-class JobLogsResponse(BaseModel):
-    job_id: str
-    entries: list[JobLogEntry]
-    truncated: bool = False
+class IOCDetail(BaseModel):
+    """Detailed IOC evidence from dynamic analysis."""
+    verdict: str
+    dynamic_hit: bool
+    network_iocs: list[str] = Field(default_factory=list)
+    process_iocs: list[str] = Field(default_factory=list)
+    file_iocs: list[str] = Field(default_factory=list)
+    dns_iocs: list[str] = Field(default_factory=list)
+    crypto_iocs: list[str] = Field(default_factory=list)
+    raw_line_count: int = 0
 
 
 class AnalyzeResponse(BaseModel):
@@ -69,6 +78,25 @@ class AnalyzeResponse(BaseModel):
     timed_out: bool
     vm_evasion_observed: bool
 
+    # Firecracker telemetry (populated when sandbox_type=firecracker + coverage!=none)
     syscall_trace: SyscallTrace | None = None
     network_activity: NetworkActivity | None = None
     filesystem_changes: FilesystemChanges | None = None
+
+    # Detailed IOC evidence (populated for firecracker runs)
+    ioc_detail: IOCDetail | None = None
+
+
+# ── Job log models ────────────────────────────────────────────────────
+
+class JobLogEntry(BaseModel):
+    timestamp: str
+    source: Literal["host", "guest", "control", "stderr", "stdout"]
+    level: Literal["debug", "info", "warning", "error"]
+    message: str
+
+
+class JobLogsResponse(BaseModel):
+    job_id: str
+    entries: list[JobLogEntry]
+    truncated: bool = False

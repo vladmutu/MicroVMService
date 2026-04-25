@@ -1,11 +1,37 @@
+"""
+test_contract.py — Wire-compatibility contract tests for POST /analyze.
+
+Uses mocked persistence so tests run without PostgreSQL.
+"""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
 
-client = TestClient(app)
+@pytest.fixture()
+def client():
+    """Create a TestClient with mocked persistence and lifecycle."""
+    # Patch persistence before importing app
+    with patch("app.services.persistence.PostgresPersistence") as MockPersistence:
+        mock_persistence = AsyncMock()
+        mock_persistence.is_connected = True
+        mock_persistence.initialize = AsyncMock()
+        mock_persistence.close = AsyncMock()
+        mock_persistence.create_job = AsyncMock()
+        mock_persistence.update_job_status = AsyncMock()
+        mock_persistence.write_telemetry = AsyncMock()
+        mock_persistence.write_log = AsyncMock()
+        mock_persistence.write_verdict = AsyncMock()
+        MockPersistence.return_value = mock_persistence
+
+        from app.main import app
+        with TestClient(app) as c:
+            yield c
 
 
-def test_analyze_contract_completed_generic() -> None:
+def test_analyze_contract_completed_generic(client) -> None:
     payload = {
         "ecosystem": "pypi",
         "package_name": "requests",
@@ -28,6 +54,7 @@ def test_analyze_contract_completed_generic() -> None:
         "syscall_trace",
         "network_activity",
         "filesystem_changes",
+        "ioc_detail",
     }
     assert expected_keys.issubset(data.keys())
     assert data["status"] in {"completed", "partial", "failed"}
@@ -38,7 +65,7 @@ def test_analyze_contract_completed_generic() -> None:
     assert isinstance(data["vm_evasion_observed"], bool)
 
 
-def test_analyze_rejects_extra_fields() -> None:
+def test_analyze_rejects_extra_fields(client) -> None:
     payload = {
         "ecosystem": "npm",
         "package_name": "left-pad",
@@ -51,6 +78,6 @@ def test_analyze_rejects_extra_fields() -> None:
     assert response.status_code == 422
 
 
-def test_health_endpoints() -> None:
+def test_health_endpoints(client) -> None:
     assert client.get("/healthz").status_code == 200
     assert client.get("/readyz").status_code == 200

@@ -1,13 +1,59 @@
+"""
+test_integration.py — Integration tests with mocked Firecracker VM lifecycle.
+"""
+
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.services.ioc_detector import IOCEvidence
+from app.services.sandbox.vm_lifecycle import VMRunResult
 
-client = TestClient(app)
+
+@pytest.fixture()
+def client():
+    """Create a TestClient with mocked persistence."""
+    with patch("app.services.persistence.PostgresPersistence") as MockPersistence:
+        mock_persistence = AsyncMock()
+        mock_persistence.is_connected = True
+        mock_persistence.initialize = AsyncMock()
+        mock_persistence.close = AsyncMock()
+        mock_persistence.create_job = AsyncMock()
+        mock_persistence.update_job_status = AsyncMock()
+        mock_persistence.write_telemetry = AsyncMock()
+        mock_persistence.write_log = AsyncMock()
+        mock_persistence.write_verdict = AsyncMock()
+        mock_persistence.get_logs = AsyncMock(return_value=[])
+        MockPersistence.return_value = mock_persistence
+
+        from app.main import app
+        with TestClient(app) as c:
+            yield c
 
 
-def test_firecracker_telemetry_fields_present_when_available() -> None:
+def _make_mock_result(verdict: str = "benign", **kwargs) -> VMRunResult:
+    """Helper to create a mock VMRunResult."""
+    return VMRunResult(
+        evidence=IOCEvidence(
+            verdict=verdict,
+            dynamic_hit=verdict != "benign",
+            network_iocs=kwargs.get("network_iocs", []),
+            process_iocs=kwargs.get("process_iocs", []),
+            file_iocs=kwargs.get("file_iocs", []),
+            dns_iocs=kwargs.get("dns_iocs", []),
+            crypto_iocs=kwargs.get("crypto_iocs", []),
+            raw_line_count=kwargs.get("raw_line_count", 100),
+            outbound_connections=len(kwargs.get("network_iocs", [])),
+            suspicious_syscalls=len(kwargs.get("process_iocs", [])),
+            sensitive_writes=len(kwargs.get("file_iocs", [])),
+        ),
+        telemetry_events=[{"event": "agent_finished", "job_id": "test"}],
+        log_lines=["[agent] test log line"],
+    )
+
+
+def test_firecracker_returns_ioc_detail(client) -> None:
     payload = {
         "ecosystem": "npm",
         "package_name": "lodash",
@@ -19,29 +65,31 @@ def test_firecracker_telemetry_fields_present_when_available() -> None:
         },
     }
 
-    fake = {
-        "suspicious_syscalls": 3,
-        "syscall_categories": ["credential_access"],
-        "outbound_connections": 1,
-        "destinations": ["203.0.113.3:443"],
-        "sensitive_writes": 2,
-        "write_paths": ["/etc/ld.so.preload"],
-        "vm_evasion_observed": False,
-    }
+    mock_result = _make_mock_result(
+        verdict="malicious",
+        network_iocs=["public_ip:8.8.8.8"],
+        process_iocs=["suspicious_exec:curl http://evil.com"],
+        file_iocs=["sensitive_file:/etc/shadow"],
+    )
 
-    with patch("app.services.sandbox.firecracker_manager.FirecrackerManager.run_vm", new_callable=AsyncMock) as run_vm:
-        run_vm.return_value.stdout = __import__("json").dumps(fake)
-        run_vm.return_value.stderr = ""
+    with patch(
+        "app.services.sandbox.vm_lifecycle.VMLifecycleManager.run_analysis",
+        new_callable=AsyncMock,
+        return_value=mock_result,
+    ):
         response = client.post("/analyze", json=payload)
 
     assert response.status_code == 200
     data = response.json()
+    assert data["status"] == "completed"
+    assert data["ioc_detail"] is not None
+    assert data["ioc_detail"]["verdict"] == "malicious"
+    assert data["ioc_detail"]["dynamic_hit"] is True
     assert data["syscall_trace"] is not None
     assert data["network_activity"] is not None
-    assert data["filesystem_changes"] is not None
 
 
-def test_partial_on_global_timeout() -> None:
+def test_partial_on_global_timeout(client) -> None:
     payload = {
         "ecosystem": "npm",
         "package_name": "express",
@@ -49,8 +97,11 @@ def test_partial_on_global_timeout() -> None:
         "sandbox_type": "generic",
     }
 
-    with patch("app.services.analysis_engine.AnalysisEngine._analyze_inner", new_callable=AsyncMock) as inner:
-        async def too_slow(_):
+    with patch(
+        "app.services.analysis_engine.AnalysisEngine._analyze_inner",
+        new_callable=AsyncMock,
+    ) as inner:
+        async def too_slow(*args):
             raise TimeoutError
 
         inner.side_effect = too_slow
@@ -63,40 +114,5 @@ def test_partial_on_global_timeout() -> None:
     assert data["timed_out"] is True
 
 
-def test_firecracker_job_logs_endpoint() -> None:
-    payload = {
-        "ecosystem": "npm",
-        "package_name": "lodash",
-        "package_version": "4.17.21",
-        "sandbox_type": "firecracker",
-        "firecracker_config": {
-            "kernel_path": "/opt/firecracker/vmlinux",
-            "rootfs_path": "/opt/firecracker/rootfs.ext4",
-        },
-    }
-
-    fake = {
-        "suspicious_syscalls": 2,
-        "syscall_categories": ["credential_access"],
-        "outbound_connections": 1,
-        "destinations": ["203.0.113.3:443"],
-        "sensitive_writes": 1,
-        "write_paths": ["/etc/ld.so.preload"],
-        "vm_evasion_observed": False,
-    }
-
-    with patch("app.services.sandbox.firecracker_manager.FirecrackerManager.run_vm", new_callable=AsyncMock) as run_vm:
-        run_vm.return_value.stdout = __import__("json").dumps(fake)
-        run_vm.return_value.stderr = ""
-        analyze_response = client.post("/analyze", json=payload)
-
-    assert analyze_response.status_code == 200
-    job_id = analyze_response.json()["job_id"]
-
-    logs_response = client.get(f"/jobs/{job_id}/logs")
-    assert logs_response.status_code == 200
-
-    logs = logs_response.json()
-    assert logs["job_id"] == job_id
-    assert logs["entries"]
-    assert any(entry["source"] == "host" for entry in logs["entries"])
+def test_health_endpoints(client) -> None:
+    assert client.get("/healthz").status_code == 200

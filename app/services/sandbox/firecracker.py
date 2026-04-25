@@ -1,21 +1,25 @@
-import json
-import inspect
+"""
+firecracker.py — SandboxRunner implementation using the unified VMLifecycleManager.
+
+Translates between the AnalysisEngine interface and the VM lifecycle.
+Maps IOCEvidence → Telemetry for risk scoring.
+"""
+
+from __future__ import annotations
 
 from app.core.config import Settings
 from app.models.contracts import AnalyzeRequest
-from app.services.errors import SandboxInfraError
-from app.services.job_store import build_log_entry
 from app.services.package_resolver import ResolvedPackage
 from app.services.sandbox.base import SandboxRunner
-from app.services.sandbox.firecracker_manager import FirecrackerManager
+from app.services.sandbox.vm_lifecycle import VMLifecycleManager, VMRunResult
 from app.services.telemetry import Telemetry
 
 
 class FirecrackerSandboxRunner(SandboxRunner):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, lifecycle: VMLifecycleManager) -> None:
         self._settings = settings
-        self._manager = FirecrackerManager(settings)
-        self.last_run_logs = []
+        self._lifecycle = lifecycle
+        self.last_run_result: VMRunResult | None = None
 
     async def run(
         self,
@@ -24,55 +28,58 @@ class FirecrackerSandboxRunner(SandboxRunner):
         timeout_seconds: float,
         job_id: str | None = None,
     ) -> Telemetry:
-        kernel = request.firecracker_config.kernel_path if request.firecracker_config else self._settings.firecracker_default_kernel
-        rootfs = request.firecracker_config.rootfs_path if request.firecracker_config else self._settings.firecracker_default_rootfs
+        kernel = (
+            request.firecracker_config.kernel_path
+            if request.firecracker_config
+            else self._settings.firecracker_default_kernel
+        )
+        rootfs = (
+            request.firecracker_config.rootfs_path
+            if request.firecracker_config
+            else self._settings.firecracker_default_rootfs
+        )
 
-        try:
-            result = await self._manager.run_vm(
-                kernel,
-                rootfs,
-                request.ecosystem,
-                request.package_name,
-                package.artifact_bytes,
-                timeout_seconds,
-                job_id=job_id,
-            )
-        except Exception as exc:
-            self.last_run_logs = list(self._manager.last_run_logs)
-            self.last_run_logs.append(build_log_entry("host", "error", f"firecracker manager error: {exc}"))
-            raise
-        guest_logs = getattr(result, "guest_logs", [])
-        self.last_run_logs = list(guest_logs) if isinstance(guest_logs, list) else []
+        result = await self._lifecycle.run_analysis(
+            job_id=job_id or "unknown",
+            job_type=request.ecosystem,
+            package_name=request.package_name,
+            artifact_bytes=package.artifact_bytes,
+            kernel_path=kernel,
+            rootfs_path=rootfs,
+        )
+        self.last_run_result = result
 
-        stdout_text = getattr(result, "stdout", "")
-        stderr_text = getattr(result, "stderr", "")
-        if not isinstance(stdout_text, str) or inspect.isawaitable(stdout_text):
-            stdout_text = ""
-        if not isinstance(stderr_text, str) or inspect.isawaitable(stderr_text):
-            stderr_text = ""
+        # Map IOCEvidence → Telemetry for risk scoring
+        ev = result.evidence
+        syscall_categories: list[str] = []
+        if ev.process_iocs:
+            syscall_categories.append("suspicious_exec")
+        if ev.crypto_iocs:
+            syscall_categories.append("crypto_mining")
+        if ev.file_iocs:
+            syscall_categories.append("sensitive_file_access")
 
-        if isinstance(stdout_text, str) and stdout_text.strip():
-            self.last_run_logs.append(build_log_entry("stdout", "info", stdout_text.strip()))
-        if isinstance(stderr_text, str) and stderr_text.strip():
-            self.last_run_logs.append(build_log_entry("stderr", "warning", stderr_text.strip()))
+        destinations: list[str] = []
+        for ioc in ev.network_iocs:
+            # Extract IP/port from "public_ip:1.2.3.4" or "suspicious_port:4444"
+            if ioc.startswith("public_ip:"):
+                destinations.append(ioc.removeprefix("public_ip:"))
+            elif ioc.startswith("suspicious_port:"):
+                destinations.append(f"*:{ioc.removeprefix('suspicious_port:')}")
 
-        try:
-            telemetry_payload = getattr(result, "telemetry_payload", None)
-            if not isinstance(telemetry_payload, dict) or inspect.isawaitable(telemetry_payload):
-                telemetry_payload = None
-            if telemetry_payload is not None:
-                payload = telemetry_payload
-            else:
-                payload = json.loads(stdout_text) if isinstance(stdout_text, str) and stdout_text.strip() else {}
-        except json.JSONDecodeError as exc:
-            raise SandboxInfraError("Invalid telemetry format from guest VM") from exc
+        write_paths = [
+            ioc.removeprefix("sensitive_file:")
+            for ioc in ev.file_iocs
+            if ioc.startswith("sensitive_file:")
+        ]
 
         return Telemetry(
-            suspicious_syscalls=int(payload.get("suspicious_syscalls", 0)),
-            syscall_categories=list(payload.get("syscall_categories", [])),
-            outbound_connections=int(payload.get("outbound_connections", 0)),
-            destinations=list(payload.get("destinations", [])),
-            sensitive_writes=int(payload.get("sensitive_writes", 0)),
-            write_paths=list(payload.get("write_paths", [])),
-            vm_evasion_observed=bool(payload.get("vm_evasion_observed", False)),
+            suspicious_syscalls=ev.suspicious_syscalls,
+            syscall_categories=syscall_categories,
+            outbound_connections=ev.outbound_connections,
+            destinations=destinations,
+            sensitive_writes=ev.sensitive_writes,
+            write_paths=write_paths,
+            vm_evasion_observed=False,
+            timed_out=result.error == "analysis timed out",
         )

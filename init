@@ -1,0 +1,42 @@
+#!/bin/sh
+# /sbin/init — Firecracker microVM init script
+#
+# Sets up the minimal environment, configures networking (if kernel
+# didn't auto-configure via ip= boot parameter), launches the agent
+# in the foreground, and powers off when done.
+
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev 2>/dev/null || true
+mkdir -p /dev/pts
+mount -t devpts none /dev/pts 2>/dev/null || true
+
+# Bring up loopback
+ip link set lo up
+
+# Network setup — the host passes ip= via kernel boot args which
+# auto-configures eth0.  If that didn't work (CONFIG_IP_PNP missing),
+# fall back to a static configuration.
+if ! ip addr show eth0 2>/dev/null | grep -q "inet "; then
+    echo "[init] Kernel ip= not applied, configuring network manually..." > /dev/console
+    ip link set eth0 up 2>/dev/null || true
+    ip addr add 172.16.0.2/30 dev eth0 2>/dev/null || true
+    ip route add default via 172.16.0.1 2>/dev/null || true
+fi
+
+# DNS resolution
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+echo "[init] Launching agent..." > /dev/console
+
+# Run agent in foreground — when it exits, poweroff
+python3 -u /opt/agent.py > /dev/console 2>&1
+AGENT_EXIT=$?
+
+echo "[init] Agent exited with code $AGENT_EXIT, powering off..." > /dev/console
+
+# Give a moment for vsock buffers to flush
+sleep 1
+
+# Clean shutdown — Firecracker will see the VM exit
+poweroff -f

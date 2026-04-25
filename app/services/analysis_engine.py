@@ -1,150 +1,215 @@
+"""
+analysis_engine.py — Main orchestration layer.
+
+Receives AnalyzeRequest, resolves the package, dispatches to the
+appropriate sandbox runner, persists results to PostgreSQL,
+and returns a structured AnalysisOutcome.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import hashlib
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
+from typing import Any
 
 from app.core.config import Settings
 from app.models.contracts import AnalyzeRequest
 from app.services.errors import AnalysisError, PackageResolutionError, SandboxInfraError, SandboxTimeoutError
-from app.services.job_store import JobLogStore, build_log_entry
 from app.services.package_resolver import PackageResolver
+from app.services.persistence import PostgresPersistence
 from app.services.risk import normalize_risk_score
 from app.services.sandbox.firecracker import FirecrackerSandboxRunner
 from app.services.sandbox.generic import GenericSandboxRunner
+from app.services.sandbox.vm_lifecycle import VMLifecycleManager
 from app.services.telemetry import Telemetry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
 class AnalysisOutcome:
-    status: str
-    coverage: str
+    status: str           # "completed" | "partial" | "failed"
+    coverage: str         # "full" | "partial" | "none"
     risk_score: float | None
     timed_out: bool
     vm_evasion_observed: bool
     telemetry: Telemetry
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 class AnalysisEngine:
-    def __init__(self, settings: Settings) -> None:
+    """
+    Orchestrates the full analysis workflow:
+    1. Resolve package from PyPI/npm registry
+    2. Dispatch to sandbox (Firecracker VM or generic fallback)
+    3. Persist telemetry, logs, and verdict to PostgreSQL
+    4. Return structured outcome for the API response
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        persistence: PostgresPersistence,
+        lifecycle: VMLifecycleManager,
+    ) -> None:
         self._settings = settings
         self._resolver = PackageResolver(settings)
         self._generic = GenericSandboxRunner()
-        self._firecracker = FirecrackerSandboxRunner(settings)
-        self._semaphore = asyncio.Semaphore(settings.max_concurrent_analyses)
-        self._job_logs = JobLogStore()
+        self._firecracker = FirecrackerSandboxRunner(settings, lifecycle)
+        self._persistence = persistence
 
     @staticmethod
     def build_job_id(request: AnalyzeRequest) -> str:
         digest = hashlib.sha256(
-            f"{request.ecosystem}:{request.package_name}:{request.package_version}:{request.sandbox_type}".encode("utf-8")
+            f"{request.ecosystem}:{request.package_name}:{request.package_version}:{request.sandbox_type}".encode()
         ).hexdigest()
         return digest[:24]
 
     async def analyze(self, request: AnalyzeRequest) -> AnalysisOutcome:
-        async with self._semaphore:
-            try:
-                return await asyncio.wait_for(
-                    self._analyze_inner(request),
-                    timeout=self._settings.analysis_timeout_seconds,
-                )
-            except (asyncio.TimeoutError, TimeoutError):
-                job_id = self.build_job_id(request)
-                telemetry = Telemetry(timed_out=True).normalized()
-                await self._job_logs.append(job_id, [build_log_entry("host", "warning", "analysis timed out")])
-                return AnalysisOutcome(
-                    status="partial",
-                    coverage="partial",
-                    risk_score=normalize_risk_score(telemetry, coverage="partial"),
-                    timed_out=True,
-                    vm_evasion_observed=False,
-                    telemetry=telemetry,
+        job_id = self.build_job_id(request)
+
+        # Create job record in PostgreSQL
+        await self._persistence.create_job(
+            job_id=job_id,
+            ecosystem=request.ecosystem,
+            package_name=request.package_name,
+            package_version=request.package_version,
+            status="running",
+        )
+
+        try:
+            outcome = await asyncio.wait_for(
+                self._analyze_inner(request, job_id),
+                timeout=self._settings.analysis_timeout_seconds,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            telemetry = Telemetry(timed_out=True).normalized()
+            await self._persistence.write_log(job_id, "host", "warning", "analysis timed out")
+            await self._persistence.update_job_status(job_id, "partial", risk_score=normalize_risk_score(telemetry, "partial"))
+            outcome = AnalysisOutcome(
+                status="partial",
+                coverage="partial",
+                risk_score=normalize_risk_score(telemetry, coverage="partial"),
+                timed_out=True,
+                vm_evasion_observed=False,
+                telemetry=telemetry,
             )
 
-    async def _analyze_inner(self, request: AnalyzeRequest) -> AnalysisOutcome:
-        job_id = self.build_job_id(request)
-        await self._job_logs.append(job_id, [build_log_entry("host", "info", f"analysis started for {request.ecosystem}:{request.package_name}:{request.package_version}")])
-        try:
-            package = await self._resolver.resolve(request.ecosystem, request.package_name, request.package_version)
-            self._validate_artifact_descriptor(request, package.artifact_bytes)
-            await self._job_logs.append(job_id, [build_log_entry("host", "info", f"resolved artifact from {package.download_url}")])
+        return outcome
 
+    async def _analyze_inner(self, request: AnalyzeRequest, job_id: str) -> AnalysisOutcome:
+        await self._persistence.write_log(
+            job_id, "host", "info",
+            f"analysis started for {request.ecosystem}:{request.package_name}:{request.package_version}",
+        )
+
+        try:
+            # 1. Resolve package
+            package = await self._resolver.resolve(
+                request.ecosystem, request.package_name, request.package_version,
+            )
+            self._validate_artifact_descriptor(request, package.artifact_bytes)
+            await self._persistence.write_log(
+                job_id, "host", "info", f"resolved artifact from {package.download_url}",
+            )
+
+            # 2. Run in sandbox
             if request.sandbox_type == "firecracker":
-                try:
-                    telemetry = await self._firecracker.run(
-                        request,
-                        package,
-                        timeout_seconds=self._settings.analysis_timeout_seconds,
-                        job_id=job_id,
-                    )
-                finally:
-                    await self._job_logs.append(job_id, self._firecracker.last_run_logs)
-            else:
-                telemetry = await self._generic.run(request, package, timeout_seconds=self._settings.analysis_timeout_seconds, job_id=job_id)
-                await self._job_logs.append(
-                    job_id,
-                    [
-                        build_log_entry(
-                            "host",
-                            "info",
-                            f"generic sandbox completed with suspicious_syscalls={telemetry.suspicious_syscalls}",
-                        )
-                    ],
+                telemetry = await self._firecracker.run(
+                    request, package,
+                    timeout_seconds=self._settings.vm_analysis_timeout_seconds,
+                    job_id=job_id,
                 )
 
+                # Persist telemetry events and logs from VM run
+                result = self._firecracker.last_run_result
+                if result:
+                    for event in result.telemetry_events:
+                        await self._persistence.write_telemetry(job_id, event)
+                    for line in result.log_lines:
+                        await self._persistence.write_log(job_id, "guest", "info", line)
+
+                    # Build evidence dict for the API response
+                    ev = result.evidence
+                    evidence = {
+                        "verdict": ev.verdict,
+                        "dynamic_hit": ev.dynamic_hit,
+                        "network_iocs": ev.network_iocs,
+                        "process_iocs": ev.process_iocs,
+                        "file_iocs": ev.file_iocs,
+                        "dns_iocs": ev.dns_iocs,
+                        "crypto_iocs": ev.crypto_iocs,
+                        "raw_line_count": ev.raw_line_count,
+                    }
+                else:
+                    evidence = {}
+            else:
+                telemetry = await self._generic.run(
+                    request, package,
+                    timeout_seconds=self._settings.analysis_timeout_seconds,
+                    job_id=job_id,
+                )
+                evidence = {}
+                await self._persistence.write_log(
+                    job_id, "host", "info",
+                    f"generic sandbox completed: suspicious_syscalls={telemetry.suspicious_syscalls}",
+                )
+
+            # 3. Finalize
             telemetry = telemetry.normalized()
-            await self._job_logs.append(job_id, [build_log_entry("host", "info", f"analysis completed with status completed and coverage full")])
+            risk_score = normalize_risk_score(telemetry, coverage="full")
+
+            # Persist verdict
+            verdict_str = evidence.get("verdict", "benign") if evidence else "benign"
+            await self._persistence.write_verdict(job_id, verdict_str, risk_score, evidence)
+            await self._persistence.update_job_status(
+                job_id, "completed", verdict=verdict_str,
+                risk_score=risk_score, evidence=evidence,
+            )
+
+            await self._persistence.write_log(
+                job_id, "host", "info",
+                f"analysis completed — verdict={verdict_str} risk_score={risk_score}",
+            )
+
             return AnalysisOutcome(
                 status="completed",
                 coverage="full",
-                risk_score=normalize_risk_score(telemetry, coverage="full"),
+                risk_score=risk_score,
                 timed_out=False,
                 vm_evasion_observed=telemetry.vm_evasion_observed,
                 telemetry=telemetry,
+                evidence=evidence,
             )
+
         except SandboxTimeoutError:
             telemetry = Telemetry(timed_out=True).normalized()
-            await self._job_logs.append(job_id, [build_log_entry("host", "warning", "sandbox timed out")])
+            await self._persistence.write_log(job_id, "host", "warning", "sandbox timed out")
+            await self._persistence.update_job_status(job_id, "partial")
             return AnalysisOutcome(
-                status="partial",
-                coverage="partial",
-                risk_score=normalize_risk_score(telemetry, coverage="partial"),
-                timed_out=True,
-                vm_evasion_observed=False,
-                telemetry=telemetry,
+                status="partial", coverage="partial",
+                risk_score=normalize_risk_score(telemetry, "partial"),
+                timed_out=True, vm_evasion_observed=False, telemetry=telemetry,
             )
-        except (PackageResolutionError, SandboxInfraError, AnalysisError):
+
+        except (PackageResolutionError, SandboxInfraError, AnalysisError) as exc:
             telemetry = Telemetry().normalized()
-            await self._job_logs.append(job_id, [build_log_entry("host", "error", "analysis failed")])
+            await self._persistence.write_log(job_id, "host", "error", f"analysis failed: {exc}")
+            await self._persistence.update_job_status(job_id, "failed")
             return AnalysisOutcome(
-                status="failed",
-                coverage="none",
+                status="failed", coverage="none",
                 risk_score=None,
-                timed_out=False,
-                vm_evasion_observed=False,
-                telemetry=telemetry,
-            )
-        except asyncio.TimeoutError:
-            telemetry = Telemetry(timed_out=True).normalized()
-            await self._job_logs.append(job_id, [build_log_entry("host", "warning", "analysis timeout raised by orchestrator")])
-            return AnalysisOutcome(
-                status="partial",
-                coverage="partial",
-                risk_score=normalize_risk_score(telemetry, coverage="partial"),
-                timed_out=True,
-                vm_evasion_observed=False,
-                telemetry=telemetry,
+                timed_out=False, vm_evasion_observed=False, telemetry=telemetry,
             )
 
     @staticmethod
     def _validate_artifact_descriptor(request: AnalyzeRequest, artifact_bytes: bytes) -> None:
         if request.artifact is None:
             return
-
         if len(artifact_bytes) != request.artifact.artifact_size:
             raise PackageResolutionError("Artifact size mismatch")
-
         digest = hashlib.sha256(artifact_bytes).hexdigest()
         if digest != request.artifact.artifact_sha256:
             raise PackageResolutionError("Artifact sha256 mismatch")
-
-    async def get_job_logs(self, job_id: str):
-        return await self._job_logs.get(job_id)

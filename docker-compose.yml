@@ -12,6 +12,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analysis -d dynamic_analysis"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   dynamic-analysis:
     build: .
@@ -26,18 +31,25 @@ services:
       - /tmp
     environment:
       PROVIDER_NAME: sentinelflow-dynamic-analysis
-      ANALYSIS_TIMEOUT_SECONDS: 25
-      MAX_CONCURRENT_ANALYSES: 8
+      ANALYSIS_TIMEOUT_SECONDS: 120
+      MAX_CONCURRENT_VMS: 4
+      VM_ANALYSIS_TIMEOUT_SECONDS: 120
+      VM_BOOT_TIMEOUT_SECONDS: 15
+      VM_INGRESS_TIMEOUT_SECONDS: 10
       PACKAGE_DOWNLOAD_TIMEOUT_SECONDS: 15
       PACKAGE_DOWNLOAD_MAX_BYTES: 52428800
       FIRECRACKER_BINARY: /usr/local/bin/firecracker
-      JAILER_BINARY: /usr/local/bin/jailer
       FIRECRACKER_DEFAULT_KERNEL: /opt/firecracker/vmlinux
       FIRECRACKER_DEFAULT_ROOTFS: /opt/firecracker/rootfs.ext4
-      FIRECRACKER_CHROOT_BASE_DIR: /tmp/dynamic-analysis/jailer
+      FIRECRACKER_WORKDIR: /tmp/dynamic-analysis
+      TAP_ENABLED: "true"
+      TAP_HOST_INTERFACE: eth0
+      CID_RANGE_START: 3
+      CID_RANGE_END: 100
       POSTGRES_DSN: postgresql://analysis:analysis@postgres:5432/dynamic_analysis
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

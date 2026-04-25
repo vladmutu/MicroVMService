@@ -1,8 +1,7 @@
 results/
 .venv/
 .venv-wsl/
-test.txt
-real_agent.py
+utils.txt
 
 .pytest_cache/
 __pycache__/
