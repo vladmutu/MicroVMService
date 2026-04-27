@@ -67,7 +67,7 @@ class AnalysisEngine:
         ).hexdigest()
         return digest[:24]
 
-    async def analyze(self, request: AnalyzeRequest) -> AnalysisOutcome:
+    async def analyze(self, request: AnalyzeRequest, artifact_bytes: bytes | None = None) -> AnalysisOutcome:
         job_id = self.build_job_id(request)
 
         # Create job record in PostgreSQL
@@ -81,8 +81,8 @@ class AnalysisEngine:
 
         try:
             outcome = await asyncio.wait_for(
-                self._analyze_inner(request, job_id),
-                timeout=self._settings.analysis_timeout_seconds,
+                self._analyze_inner(request, job_id, artifact_bytes),
+                timeout=125.0,
             )
         except (asyncio.TimeoutError, TimeoutError):
             telemetry = Telemetry(timed_out=True).normalized()
@@ -99,7 +99,7 @@ class AnalysisEngine:
 
         return outcome
 
-    async def _analyze_inner(self, request: AnalyzeRequest, job_id: str) -> AnalysisOutcome:
+    async def _analyze_inner(self, request: AnalyzeRequest, job_id: str, artifact_bytes: bytes | None = None) -> AnalysisOutcome:
         await self._persistence.write_log(
             job_id, "host", "info",
             f"analysis started for {request.ecosystem}:{request.package_name}:{request.package_version}",
@@ -107,9 +107,20 @@ class AnalysisEngine:
 
         try:
             # 1. Resolve package
-            package = await self._resolver.resolve(
-                request.ecosystem, request.package_name, request.package_version,
-            )
+            if artifact_bytes is not None:
+                from app.services.package_resolver import ResolvedPackage
+                package = ResolvedPackage(
+                    ecosystem=request.ecosystem,
+                    package_name=request.package_name,
+                    package_version=request.package_version,
+                    download_url="local-upload",
+                    expected_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
+                    artifact_bytes=artifact_bytes,
+                )
+            else:
+                package = await self._resolver.resolve(
+                    request.ecosystem, request.package_name, request.package_version,
+                )
             self._validate_artifact_descriptor(request, package.artifact_bytes)
             await self._persistence.write_log(
                 job_id, "host", "info", f"resolved artifact from {package.download_url}",
@@ -178,7 +189,7 @@ class AnalysisEngine:
                 status="completed",
                 coverage="full",
                 risk_score=risk_score,
-                timed_out=False,
+                timed_out=telemetry.timed_out,
                 vm_evasion_observed=telemetry.vm_evasion_observed,
                 telemetry=telemetry,
                 evidence=evidence,

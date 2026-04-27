@@ -36,8 +36,8 @@ class Settings(BaseSettings):
     )
 
     # ── VM resources ──────────────────────────────────────────────────
-    firecracker_vcpu_count: int = Field(default=1, gt=0, le=4)
-    firecracker_mem_mib: int = Field(default=512, gt=128, le=4096)
+    firecracker_vcpu_count: int = Field(default=2, gt=0, le=4)
+    firecracker_mem_mib: int = Field(default=1024, gt=128, le=4096)
 
     # ── CID allocation (must be unique per concurrent VM, ≥ 3) ───────
     cid_range_start: int = Field(default=3, ge=3)

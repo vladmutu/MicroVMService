@@ -139,6 +139,16 @@ class LogStream:
         self.ch.send_line(text.encode("utf-8", errors="replace"))
 
 
+def debug_step(log_stream: LogStream | None, message: str) -> None:
+    line = f"[agent-debug] {message}"
+    print(line, flush=True)
+    if log_stream is not None:
+        try:
+            log_stream.write(line)
+        except Exception:
+            pass
+
+
 def stream_file_lines(path: Path, log_stream: LogStream) -> None:
     """Stream a file's contents line by line to the host."""
     if not path.exists():
@@ -152,6 +162,19 @@ def stream_file_lines(path: Path, log_stream: LogStream) -> None:
     except Exception as exc:
         log_stream.write(f"[agent] failed to stream {path.name}: {exc}")
 
+
+class VsockLogger:
+    """Catches stdout/stderr and routes them through the vsock log channel."""
+    def __init__(self, log_stream: LogStream, prefix: str):
+        self.log_stream = log_stream
+        self.prefix = prefix
+
+    def write(self, text: str) -> None:
+        if text.strip():
+            self.log_stream.write(f"{self.prefix} {text.strip()}")
+
+    def flush(self) -> None:
+        pass
 
 # ---------------------------------------------------------------------------
 # Ingress: read framed job from vsock port 7000
@@ -278,31 +301,41 @@ def extract_artifact(job_type: str) -> None:
 def build_install_command(
     job_type: str, package_name: str, has_artifact: bool,
 ) -> list[str]:
+    # Define absolute paths for binaries inside the microVM rootfs
+    NPM_PATH = "/usr/bin/npm"
+    PIP_PATH = "/usr/bin/pip3"
+
     if job_type == "pypi":
         if has_artifact:
             target = str(ARTIFACT_PATH)
             suffix = ARTIFACT_PATH.suffix.lower()
             if suffix == ".whl":
-                return ["pip3", "install", "--no-cache-dir", "--no-index", target]
+                return [PIP_PATH, "install", "--no-cache-dir", "--no-index", target]
             else:
-                return ["pip3", "install", "--no-cache-dir", "--no-deps", target]
+                return [PIP_PATH, "install", "--no-cache-dir", "--no-deps", target]
         else:
-            return ["pip3", "install", "--no-cache-dir", "--no-deps", package_name]
+            return [PIP_PATH, "install", "--no-cache-dir", "--no-deps", package_name]
     else:  # npm
         target = str(ARTIFACT_PATH) if has_artifact else package_name
-        return ["npm", "install", "--no-fund", "--no-audit", target]
+        # Use the absolute path to /usr/bin/npm
+        return [NPM_PATH, "install", "--no-fund", "--no-audit", target]
 
 
 def _run_command_with_timeout(
     cmd: list[str], log_stream: LogStream, timeout: int,
 ) -> int:
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as e:
+        log_stream.write(f"[agent] Command not found: {cmd[0]} ({e})")
+        return 127
+
     try:
         stdout, _ = proc.communicate(timeout=timeout)
         if stdout:
@@ -316,49 +349,86 @@ def _run_command_with_timeout(
     return proc.returncode or 0
 
 
-def run_with_strace(
-    cmd: list[str],
-    log_path: Path,
-    log_stream: LogStream,
-    tel: Telemetry,
-    timeout: int = 60,
-) -> int:
-    """Run cmd under verbose strace and stream the raw trace to the host."""
+import threading
+
+def run_with_strace(cmd, log_path, log_stream, tel, timeout=60):
     strace_cmd = [
-        "strace",
-        "-f",              # follow forks
-        "-v",              # verbose output
-        "-s", "2048",      # max string size
-        "-y",              # resolve file descriptors
-        "-yy",             # resolve socket addresses
+        "strace", "-f", "-v", "-s", "2048", "-y", "-yy",
         "-e", "trace=network,process,file,desc",
         "-o", str(log_path),
         "--timestamps=unix,us",
     ] + cmd
 
     try:
-        exit_code = _run_command_with_timeout(strace_cmd, log_stream, timeout)
-        # Stream the strace output file to the host for IOC analysis
-        stream_file_lines(log_path, log_stream)
-        return exit_code
+        proc = subprocess.Popen(
+            strace_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+
+        # Stream strace log LIVE in a background thread
+        def tail_log():
+            import time
+            sent = 0
+            while proc.poll() is None:
+                if log_path.exists():
+                    with log_path.open("r", errors="replace") as f:
+                        f.seek(sent)
+                        for line in f:
+                            if line.strip():
+                                log_stream.write(line.rstrip())
+                        sent = f.tell()
+                time.sleep(0.2)
+            # Final flush after process exits
+            if log_path.exists():
+                with log_path.open("r", errors="replace") as f:
+                    f.seek(sent)
+                    for line in f:
+                        if line.strip():
+                            log_stream.write(line.rstrip())
+
+        tailer = threading.Thread(target=tail_log, daemon=True)
+        tailer.start()
+
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+            if stdout:
+                for line in stdout.splitlines():
+                    if line:
+                        log_stream.write(line)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            log_stream.write(f"[agent] strace timed out after {timeout}s")
+
+        tailer.join(timeout=2.0)
+        return proc.returncode or 0
+
     except FileNotFoundError:
-        tel.emit("warning", message="strace not found; running without tracing", cmd=cmd)
+        tel.emit("warning", message="strace not found", cmd=cmd)
         return _run_command_with_timeout(cmd, log_stream, timeout)
 
 
 def find_entry_points(job_type: str, package_name: str) -> list[list[str]]:
-    """Return a list of post-install probe commands."""
+    """Return a list of post-install probe commands using absolute paths."""
     cmds: list[list[str]] = []
+    
+    # Define absolute paths for binaries in the microVM
+    NODE_PATH = "/usr/bin/node"
+    PYTHON_PATH = "/usr/bin/python3"
+
     if job_type == "pypi":
         safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", package_name.split("==")[0])
-        cmds.append(["python3", "-c", f"import {safe_name}; print('import OK')"])
-        cmds.append(["python3", "-m", safe_name])
+        cmds.append([PYTHON_PATH, "-c", f"import {safe_name}; print('import OK')"])
+        cmds.append([PYTHON_PATH, "-m", safe_name])
+        
     elif job_type == "npm":
         # Check for index.js or main entry
         main_js = EXTRACT_DIR / "package" / "index.js"
         if main_js.exists():
-            cmds.append(["node", str(main_js)])
-        # Also try running via npx if a bin is defined
+            cmds.append([NODE_PATH, str(main_js)])
+            
         pkg_json = EXTRACT_DIR / "package" / "package.json"
         if pkg_json.exists():
             try:
@@ -366,10 +436,10 @@ def find_entry_points(job_type: str, package_name: str) -> list[list[str]]:
                 if "bin" in meta:
                     bins = meta["bin"]
                     if isinstance(bins, str):
-                        cmds.append(["node", str(EXTRACT_DIR / "package" / bins)])
+                        cmds.append([NODE_PATH, str(EXTRACT_DIR / "package" / bins)])
                     elif isinstance(bins, dict):
                         for _, script in bins.items():
-                            cmds.append(["node", str(EXTRACT_DIR / "package" / script)])
+                            cmds.append([NODE_PATH, str(EXTRACT_DIR / "package" / script)])
             except Exception:
                 pass
     return cmds
@@ -426,48 +496,80 @@ def main() -> None:
     tel = Telemetry(job_id, tel_ch)
     log = LogStream(log_ch)
 
-    tel.emit("agent_started", job_type=job_type, package=package_name,
-             artifact_size=artifact_size)
+    # Hijack stdout and stderr! All prints and crashes now go to Uvicorn.
+    sys.stdout = VsockLogger(log, "[stdout]")
+    sys.stderr = VsockLogger(log, "[stderr]")
 
-    # --- Phase 1: Artifact handling ---
-    has_artifact = artifact_size > 0 and len(artifact_bytes) == artifact_size
+    debug_step(log, f"started job_id={job_id} type={job_type} package={package_name} artifact_size={artifact_size}")
 
-    if has_artifact:
-        hash_ok = save_and_verify_artifact(artifact_bytes, expected_sha256, job_type)
-        if not hash_ok:
-            tel.emit("artifact_hash_mismatch",
-                     expected=expected_sha256,
-                     actual=hashlib.sha256(artifact_bytes).hexdigest())
+    tel.emit("agent_started", job_type=job_type, package=package_name, artifact_size=artifact_size)
+
+    try:
+        # --- Phase 1: Artifact handling ---
+        debug_step(log, "phase_1_artifact_handling_started")
+        has_artifact = artifact_size > 0 and len(artifact_bytes) == artifact_size
+
+        if has_artifact:
+            hash_ok = save_and_verify_artifact(artifact_bytes, expected_sha256, job_type)
+            if not hash_ok:
+                debug_step(log, "artifact_hash_mismatch_detected")
+                tel.emit("artifact_hash_mismatch",
+                         expected=expected_sha256,
+                         actual=hashlib.sha256(artifact_bytes).hexdigest())
+            else:
+                debug_step(log, f"artifact_received size={len(artifact_bytes)}")
+                tel.emit("artifact_received",
+                         size=len(artifact_bytes),
+                         sha256=hashlib.sha256(artifact_bytes).hexdigest())
+            extract_artifact(job_type)
+            debug_step(log, f"artifact_extracted path={ARTIFACT_PATH}")
         else:
-            tel.emit("artifact_received",
-                     size=len(artifact_bytes),
-                     sha256=hashlib.sha256(artifact_bytes).hexdigest())
-        extract_artifact(job_type)
-    else:
-        WORK_DIR.mkdir(parents=True, exist_ok=True)
-        tel.emit("artifact_received", size=0, note="no artifact — install from index")
+            WORK_DIR.mkdir(parents=True, exist_ok=True)
+            tel.emit("artifact_received", size=0, note="no artifact — install from index")
+            debug_step(log, "no_artifact_received_install_from_index")
 
-    # --- Phase 2: Install under strace ---
-    install_cmd = build_install_command(job_type, package_name, has_artifact)
-    tel.emit("install_started", cmd=install_cmd)
-    log.write(f"[agent] running: {' '.join(install_cmd)}")
+        # --- Phase 2: Install under strace ---
+        debug_step(log, "phase_2_install_started")
+        install_cmd = build_install_command(job_type, package_name, has_artifact)
+        tel.emit("install_started", cmd=install_cmd)
+        print(f"Starting installation command: {install_cmd}") # This will now show up in Uvicorn!
 
-    install_strace = WORK_DIR / "strace_install.log"
-    exit_code = run_with_strace(install_cmd, install_strace, log, tel, timeout=60)
-    tel.emit("install_done", exit_code=exit_code)
+        install_strace = WORK_DIR / "strace_install.log"
+        exit_code = run_with_strace(install_cmd, install_strace, log, tel, timeout=60)
+        tel.emit("install_done", exit_code=exit_code)
+        debug_step(log, f"install_finished exit_code={exit_code}")
 
-    # --- Phase 3: Post-install execution probes ---
-    executed = run_execution_probes(job_type, package_name, log, tel)
+        # --- Phase 3: Post-install execution probes ---
+        debug_step(log, "phase_3_execution_probes_started")
+        executed = run_execution_probes(job_type, package_name, log, tel)
+        debug_step(log, f"execution_probes_finished count={len(executed)}")
 
-    # --- Signal completion (host does verdict, not us) ---
-    tel.emit("agent_finished",
-             install_exit_code=exit_code,
-             probes=len(executed))
-    log.write(f"[agent] finished install_exit_code={exit_code} probes={len(executed)}")
+        # --- Signal normal completion ---
+        tel.emit("verdict", 
+                 status="completed",
+                 install_exit_code=exit_code,
+                 probes=len(executed))
+        tel.emit("agent_finished", install_exit_code=exit_code, probes=len(executed))
+        debug_step(log, "completion_events_emitted verdict+agent_finished")
+        print(f"Finished normally with exit_code={exit_code} probes={len(executed)}")
 
-    # Flush and close channels
-    tel_ch.close()
-    log_ch.close()
+    except Exception as e:
+        # --- Catch ANY crash and report it immediately ---
+        import traceback
+        err_msg = traceback.format_exc()
+        print(f"FATAL AGENT CRASH:\n{err_msg}") # Sends traceback to Uvicorn via vsock
+        debug_step(log, f"agent_crashed error={e}")
+        
+        tel.emit("verdict", 
+                 status="crashed", 
+                 error=str(e))
+        tel.emit("agent_finished", status="crashed", error=str(e))
+
+    finally:
+        debug_step(log, "closing_channels")
+        # Flush and close channels
+        tel_ch.close()
+        log_ch.close()
 
 
 if __name__ == "__main__":

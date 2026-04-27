@@ -1,9 +1,8 @@
 #!/bin/sh
 # /sbin/init — Firecracker microVM init script
-#
-# Sets up the minimal environment, configures networking (if kernel
-# didn't auto-configure via ip= boot parameter), launches the agent
-# in the foreground, and powers off when done.
+
+# THE FIX: Tell the system where binaries live
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
 
 mount -t proc none /proc
 mount -t sysfs none /sys
@@ -40,3 +39,4 @@ sleep 1
 
 # Clean shutdown — Firecracker will see the VM exit
 poweroff -f
+EOF

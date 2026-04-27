@@ -8,8 +8,9 @@ GET  /jobs/{job_id}/logs — per-job log retrieval.
 """
 
 import time
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, File, Form, UploadFile
 
 from app.core.auth import optional_bearer_auth
 from app.core.config import get_settings
@@ -73,6 +74,86 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
         include_fc = body.sandbox_type == "firecracker" and outcome.coverage != "none"
 
         # Build IOC detail from evidence
+        ioc_detail = None
+        if include_fc and outcome.evidence:
+            ioc_detail = IOCDetail(
+                verdict=outcome.evidence.get("verdict", "benign"),
+                dynamic_hit=outcome.evidence.get("dynamic_hit", False),
+                network_iocs=outcome.evidence.get("network_iocs", []),
+                process_iocs=outcome.evidence.get("process_iocs", []),
+                file_iocs=outcome.evidence.get("file_iocs", []),
+                dns_iocs=outcome.evidence.get("dns_iocs", []),
+                crypto_iocs=outcome.evidence.get("crypto_iocs", []),
+                raw_line_count=outcome.evidence.get("raw_line_count", 0),
+            )
+
+        return AnalyzeResponse(
+            status=outcome.status,
+            coverage=outcome.coverage,
+            risk_score=outcome.risk_score,
+            provider=settings.provider_name,
+            job_id=engine.build_job_id(body),
+            timed_out=outcome.timed_out,
+            vm_evasion_observed=outcome.vm_evasion_observed,
+            syscall_trace=(
+                SyscallTrace(
+                    suspicious_count=telemetry.suspicious_syscalls,
+                    categories=telemetry.syscall_categories or [],
+                )
+                if include_fc else None
+            ),
+            network_activity=(
+                NetworkActivity(
+                    outbound_connections=telemetry.outbound_connections,
+                    destinations=telemetry.destinations or [],
+                )
+                if include_fc else None
+            ),
+            filesystem_changes=(
+                FilesystemChanges(
+                    sensitive_path_writes=telemetry.sensitive_writes,
+                    paths=telemetry.write_paths or [],
+                )
+                if include_fc else None
+            ),
+            ioc_detail=ioc_detail,
+        )
+    finally:
+        IN_FLIGHT.dec()
+        REQUEST_DURATION.observe(time.perf_counter() - started)
+
+
+@router.post("/analyze/upload", response_model=AnalyzeResponse, dependencies=[Depends(optional_bearer_auth)])
+async def analyze_upload(
+    request: Request,
+    ecosystem: Literal["npm", "pypi"] = Form(...),
+    package_name: str = Form(...),
+    package_version: str = Form(...),
+    sandbox_type: Literal["generic", "firecracker"] = Form(...),
+    file: UploadFile = File(...),
+) -> AnalyzeResponse:
+    """Analyze a locally uploaded package archive."""
+    engine = _get_engine(request)
+    settings = get_settings()
+
+    body = AnalyzeRequest(
+        ecosystem=ecosystem,
+        package_name=package_name,
+        package_version=package_version,
+        sandbox_type=sandbox_type,
+    )
+
+    artifact_bytes = await file.read()
+
+    started = time.perf_counter()
+    IN_FLIGHT.inc()
+    try:
+        outcome = await engine.analyze(body, artifact_bytes=artifact_bytes)
+        REQUEST_COUNTER.labels(body.ecosystem, body.sandbox_type, outcome.status).inc()
+
+        telemetry = outcome.telemetry
+        include_fc = body.sandbox_type == "firecracker" and outcome.coverage != "none"
+
         ioc_detail = None
         if include_fc and outcome.evidence:
             ioc_detail = IOCDetail(

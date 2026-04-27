@@ -122,7 +122,7 @@ class TAPManager:
         ]
 
         # Enable IP forwarding
-        await self._run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+        await self._run(["sysctl", "-w", "net.ipv4.ip_forward=1"], ignore_errors=False)
 
         for cmd in cmds:
             await self._run(cmd, ignore_errors=True)
@@ -271,14 +271,14 @@ class VMLifecycleManager:
                 asyncio.to_thread(
                     self._deliver_job, workspace, job_id, job_type, package_name, artifact_bytes
                 ),
-                timeout=self._settings.vm_ingress_timeout_seconds,
+                timeout=120.0,
             )
             logger.info("[%s] Job delivered to guest", job_id)
 
             # 8. Wait for agent_finished signal
             await asyncio.wait_for(
                 finished_signal.wait(),
-                timeout=self._settings.vm_analysis_timeout_seconds,
+                timeout=120.0,
             )
             logger.info("[%s] Agent finished", job_id)
 
@@ -379,6 +379,11 @@ class VMLifecycleManager:
                 "kernel_image_path": kernel_path,
                 "boot_args": boot_args,
             })
+            await self._put(client, "/machine-config", {
+                "vcpu_count": self._settings.firecracker_vcpu_count,
+                "mem_size_mib": self._settings.firecracker_mem_mib,
+                "smt": False,
+            })
             await self._put(client, "/drives/rootfs", {
                 "drive_id": "rootfs",
                 "path_on_host": str(workspace.rootfs_path),
@@ -458,12 +463,19 @@ class VMLifecycleManager:
             telemetry_events.append(event)
             logger.debug("[%s][telemetry] %s", job_id, text[:200])
             if event.get("event") in {"agent_finished", "verdict"}:
-                finished_signal.set()
+                # Give a short delay to allow log_lines from vsock port 7002 to flush
+                # before setting finished_signal and tearing down the VM.
+                async def _signal() -> None:
+                    await asyncio.sleep(0.5)
+                    finished_signal.set()
+                asyncio.create_task(_signal())
+            print(f"GUEST TELEMETRY: {text}", flush=True)
 
         async def on_log_line(text: str) -> None:
             log_lines.append(text)
             detector.observe_line(text)
             logger.debug("[%s][log] %s", job_id, text[:200])
+            print(f"GUEST LOG: {text}", flush=True)
 
         # Remove stale sockets
         for sock_path in (workspace.telemetry_socket, workspace.log_socket):
@@ -476,10 +488,12 @@ class VMLifecycleManager:
         telemetry_server = await asyncio.start_unix_server(
             lambda r, w: _handle_channel(r, w, tel_port, on_telemetry_line),
             path=str(workspace.telemetry_socket),
+            limit=5 * 1024 * 1024,  # 5MB limit for large strace lines
         )
         log_server = await asyncio.start_unix_server(
             lambda r, w: _handle_channel(r, w, log_port, on_log_line),
             path=str(workspace.log_socket),
+            limit=5 * 1024 * 1024,  # 5MB limit for large strace lines
         )
 
         tasks = [
@@ -568,44 +582,34 @@ class VMLifecycleManager:
         serve_tasks: list[asyncio.Task[None]],
         pipe_tasks: list[asyncio.Task[None]],
     ) -> None:
-        # Close UDS servers
+        # 1. Close UDS servers (No awaiting)
         for server in (telemetry_server, log_server):
             if server:
                 server.close()
-                with suppress(Exception):
-                    await server.wait_closed()
 
-        # Cancel serve_forever tasks
+        # 2. Cancel serve_forever tasks (No awaiting)
         for task in serve_tasks:
             task.cancel()
-            with suppress(Exception):
-                await task
 
-        # Terminate Firecracker process
+        # 3. Terminate Firecracker process
         if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=self._settings.vm_teardown_timeout_seconds)
-            except (asyncio.TimeoutError, Exception):
-                proc.kill()
-                with suppress(Exception):
-                    await asyncio.to_thread(proc.wait)
+            proc.kill()
+            with suppress(Exception):
+                await asyncio.to_thread(proc.wait)
 
-        # Close pipe readers
+        # 4. Close pipe readers (No awaiting)
         for task in pipe_tasks:
             task.cancel()
-            with suppress(Exception):
-                await task
 
-        # Teardown TAP networking
+        # 5. Teardown TAP networking
         if self._tap_mgr:
             with suppress(Exception):
                 await self._tap_mgr.teardown(slot)
 
-        # Release CID back to pool
+        # 6. Release CID back to pool
         await self._cid_pool.release(cid)
 
-        # Remove workspace
+        # 7. Remove workspace
         if workspace:
             with suppress(Exception):
                 shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
@@ -631,11 +635,17 @@ class VMLifecycleManager:
                 break
             text = line.decode("utf-8", errors="replace").rstrip("\n")
             if text:
-                log_lines.append(f"[{label}] {text}")
+                message = f"[{label}] {text}"
+                log_lines.append(message)
+                print(message, flush=True)
 
     @staticmethod
     async def _put(client: httpx.AsyncClient, endpoint: str, payload: dict[str, Any]) -> None:
         response = await client.put(endpoint, json=payload)
+
+        if response.status_code >= 400:
+            print(f"\n[FIRECRACKER API ERROR] {endpoint}: {response.text}\n", flush=True)
+
         response.raise_for_status()
 
     @staticmethod
