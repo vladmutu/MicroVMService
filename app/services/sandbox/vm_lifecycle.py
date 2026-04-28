@@ -507,9 +507,10 @@ class VMLifecycleManager:
                 with suppress(json.JSONDecodeError):
                     parsed_event = json.loads(text)
 
-                if parsed_event and isinstance(parsed_event, dict):
+            if parsed_event and isinstance(parsed_event, dict):
                 event_type = parsed_event.get("event")
-                    if event_type in {
+                # Structured event path
+                if event_type in {
                     "syscall_event",
                     "process_start",
                     "process_exit",
@@ -521,38 +522,37 @@ class VMLifecycleManager:
                     "ipc_event",
                     "mmap_event",
                 }:
-                        # Snapshot IOC lists to detect new hits from this event
-                        before_counts = (
-                            len(detector.network_iocs),
-                            len(detector.process_iocs),
-                            len(detector.file_iocs),
-                            len(detector.dns_iocs),
-                            len(detector.crypto_iocs),
-                        )
-                        detector.observe_event(parsed_event)
-                        after_counts = (
-                            len(detector.network_iocs),
-                            len(detector.process_iocs),
-                            len(detector.file_iocs),
-                            len(detector.dns_iocs),
-                            len(detector.crypto_iocs),
-                        )
-                        # If any of the IOC lists grew, persist the raw line as suspicious
-                        if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
-                            categories = []
-                            if after_counts[0] > before_counts[0]:
-                                categories.append("network")
-                            if after_counts[1] > before_counts[1]:
-                                categories.append("process")
-                            if after_counts[2] > before_counts[2]:
-                                categories.append("file")
-                            if after_counts[3] > before_counts[3]:
-                                categories.append("dns")
-                            if after_counts[4] > before_counts[4]:
-                                categories.append("crypto")
-                            category = ",".join(categories) if categories else None
-                            with suppress(Exception):
-                                await self._persistence.write_suspicious_line(job_id, text, category=category)
+                    before_counts = (
+                        len(detector.network_iocs),
+                        len(detector.process_iocs),
+                        len(detector.file_iocs),
+                        len(detector.dns_iocs),
+                        len(detector.crypto_iocs),
+                    )
+                    detector.observe_event(parsed_event)
+                    after_counts = (
+                        len(detector.network_iocs),
+                        len(detector.process_iocs),
+                        len(detector.file_iocs),
+                        len(detector.dns_iocs),
+                        len(detector.crypto_iocs),
+                    )
+                    if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
+                        categories = []
+                        if after_counts[0] > before_counts[0]:
+                            categories.append("network")
+                        if after_counts[1] > before_counts[1]:
+                            categories.append("process")
+                        if after_counts[2] > before_counts[2]:
+                            categories.append("file")
+                        if after_counts[3] > before_counts[3]:
+                            categories.append("dns")
+                        if after_counts[4] > before_counts[4]:
+                            categories.append("crypto")
+                        category = ",".join(categories) if categories else None
+                        with suppress(Exception):
+                            await self._persistence.write_suspicious_line(job_id, text, category=category)
+
                     cleaned = _clean_runtime_event(parsed_event)
                     if cleaned is not None:
                         relevant_runtime_events.append(cleaned)
@@ -562,7 +562,6 @@ class VMLifecycleManager:
                     if not isinstance(payload_text, str) or not payload_text:
                         payload_text = parsed_event.get("line")
                     if isinstance(payload_text, str) and payload_text:
-                        # Snapshot IOC lists to detect new hits from this line
                         before_counts = (
                             len(detector.network_iocs),
                             len(detector.process_iocs),
