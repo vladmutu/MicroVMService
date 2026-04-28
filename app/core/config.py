@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     bearer_token: str | None = None
 
     # ── Analysis orchestration ────────────────────────────────────────
-    analysis_timeout_seconds: float = Field(default=120.0, gt=1.0, le=600.0)
+    analysis_timeout_seconds: float = Field(default=180.0, gt=1.0, le=600.0)
     max_concurrent_vms: int = Field(default=4, gt=0, le=64)
 
     # ── Package resolution ────────────────────────────────────────────
@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     vm_boot_timeout_seconds: float = Field(default=15.0, gt=1.0, le=60.0)
     vm_ingress_timeout_seconds: float = Field(default=10.0, gt=1.0, le=60.0)
     vm_ingress_grace_seconds: float = Field(default=2.0, ge=0.0, le=15.0)
-    vm_analysis_timeout_seconds: float = Field(default=120.0, gt=1.0, le=600.0)
+    vm_analysis_timeout_seconds: float = Field(default=180.0, gt=1.0, le=600.0)
     vm_teardown_timeout_seconds: float = Field(default=5.0, gt=0.5, le=30.0)
 
     # ── Vsock port assignments ────────────────────────────────────────

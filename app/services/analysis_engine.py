@@ -82,7 +82,7 @@ class AnalysisEngine:
         try:
             outcome = await asyncio.wait_for(
                 self._analyze_inner(request, job_id, artifact_bytes),
-                timeout=125.0,
+                timeout=self._settings.analysis_timeout_seconds,
             )
         except (asyncio.TimeoutError, TimeoutError):
             telemetry = Telemetry(timed_out=True).normalized()
@@ -141,6 +141,12 @@ class AnalysisEngine:
                         await self._persistence.write_telemetry(job_id, event)
                     for line in result.log_lines:
                         await self._persistence.write_log(job_id, "guest", "info", line)
+                    if result.relevant_runtime_events or result.relevant_runtime_summary:
+                        await self._persistence.write_relevant_runtime_events(
+                            job_id,
+                            result.relevant_runtime_summary,
+                            result.relevant_runtime_events,
+                        )
 
                     # Build evidence dict for the API response
                     ev = result.evidence
@@ -170,24 +176,26 @@ class AnalysisEngine:
 
             # 3. Finalize
             telemetry = telemetry.normalized()
-            risk_score = normalize_risk_score(telemetry, coverage="full")
+            coverage = "partial" if telemetry.timed_out else "full"
+            status = "partial" if telemetry.timed_out else "completed"
+            risk_score = normalize_risk_score(telemetry, coverage=coverage)
 
             # Persist verdict
             verdict_str = evidence.get("verdict", "benign") if evidence else "benign"
             await self._persistence.write_verdict(job_id, verdict_str, risk_score, evidence)
             await self._persistence.update_job_status(
-                job_id, "completed", verdict=verdict_str,
+                job_id, status, verdict=verdict_str,
                 risk_score=risk_score, evidence=evidence,
             )
 
             await self._persistence.write_log(
                 job_id, "host", "info",
-                f"analysis completed — verdict={verdict_str} risk_score={risk_score}",
+                f"analysis {status} — verdict={verdict_str} risk_score={risk_score}",
             )
 
             return AnalysisOutcome(
-                status="completed",
-                coverage="full",
+                status=status,
+                coverage=coverage,
                 risk_score=risk_score,
                 timed_out=telemetry.timed_out,
                 vm_evasion_observed=telemetry.vm_evasion_observed,

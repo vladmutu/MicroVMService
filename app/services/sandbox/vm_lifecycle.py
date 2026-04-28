@@ -26,6 +26,7 @@ import httpx
 
 from app.core.config import Settings
 from app.services.ioc_detector import DynamicIOCDetector, IOCEvidence
+from app.services.persistence import PostgresPersistence
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ class VMRunResult:
     """Outcome of a single VM analysis run."""
     evidence: IOCEvidence
     telemetry_events: list[dict[str, Any]] = field(default_factory=list)
+    relevant_runtime_events: list[dict[str, Any]] = field(default_factory=list)
+    relevant_runtime_summary: dict[str, Any] = field(default_factory=dict)
     log_lines: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -180,11 +183,12 @@ class VMLifecycleManager:
     10. Teardown everything (kill FC, remove TAP, release CID, rm workspace)
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, persistence: PostgresPersistence | None = None) -> None:
         self._settings = settings
         self._cid_pool = CIDAllocator(settings.cid_range_start, settings.cid_range_end)
         self._tap_mgr = TAPManager(settings) if settings.tap_enabled else None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_vms)
+        self._persistence = persistence
 
     @property
     def available_slots(self) -> int:
@@ -227,6 +231,17 @@ class VMLifecycleManager:
 
         detector = DynamicIOCDetector()
         telemetry_events: list[dict[str, Any]] = []
+        relevant_runtime_events: list[dict[str, Any]] = []
+        relevant_runtime_summary: dict[str, Any] = {
+            "event_count": 0,
+            "syscall_count": 0,
+            "process_count": 0,
+            "network_count": 0,
+            "file_count": 0,
+            "dns_count": 0,
+            "artifact_count": 0,
+            "events": [],
+        }
         log_lines: list[str] = []
         finished_signal = asyncio.Event()
 
@@ -262,7 +277,14 @@ class VMLifecycleManager:
 
             # 6. Start UDS listeners for telemetry + logs
             telemetry_server, log_server, t_tasks = await self._start_listeners(
-                workspace, detector, telemetry_events, log_lines, finished_signal, job_id,
+                workspace,
+                detector,
+                telemetry_events,
+                relevant_runtime_events,
+                relevant_runtime_summary,
+                log_lines,
+                finished_signal,
+                job_id,
             )
             serve_tasks.extend(t_tasks)
 
@@ -271,14 +293,14 @@ class VMLifecycleManager:
                 asyncio.to_thread(
                     self._deliver_job, workspace, job_id, job_type, package_name, artifact_bytes
                 ),
-                timeout=120.0,
+                timeout=self._settings.vm_ingress_timeout_seconds,
             )
             logger.info("[%s] Job delivered to guest", job_id)
 
             # 8. Wait for agent_finished signal
             await asyncio.wait_for(
                 finished_signal.wait(),
-                timeout=120.0,
+                timeout=self._settings.vm_analysis_timeout_seconds,
             )
             logger.info("[%s] Agent finished", job_id)
 
@@ -287,6 +309,8 @@ class VMLifecycleManager:
             return VMRunResult(
                 evidence=evidence,
                 telemetry_events=telemetry_events,
+                relevant_runtime_events=relevant_runtime_events,
+                relevant_runtime_summary=relevant_runtime_summary,
                 log_lines=log_lines,
             )
 
@@ -296,6 +320,8 @@ class VMLifecycleManager:
             return VMRunResult(
                 evidence=evidence,
                 telemetry_events=telemetry_events,
+                relevant_runtime_events=relevant_runtime_events,
+                relevant_runtime_summary=relevant_runtime_summary,
                 log_lines=log_lines,
                 error="analysis timed out",
             )
@@ -305,6 +331,8 @@ class VMLifecycleManager:
             return VMRunResult(
                 evidence=evidence,
                 telemetry_events=telemetry_events,
+                relevant_runtime_events=relevant_runtime_events,
+                relevant_runtime_summary=relevant_runtime_summary,
                 log_lines=log_lines,
                 error=str(exc),
             )
@@ -418,6 +446,8 @@ class VMLifecycleManager:
         workspace: VMWorkspace,
         detector: DynamicIOCDetector,
         telemetry_events: list[dict[str, Any]],
+        relevant_runtime_events: list[dict[str, Any]],
+        relevant_runtime_summary: dict[str, Any],
         log_lines: list[str],
         finished_signal: asyncio.Event,
         job_id: str,
@@ -449,7 +479,7 @@ class VMLifecycleManager:
             except asyncio.TimeoutError:
                 logger.warning("[%s] Handshake timeout on port %d", job_id, port)
             except Exception as exc:
-                logger.debug("[%s] Channel %d error: %s", job_id, port, exc)
+                logger.error("[%s] Channel %d error: %r", job_id, port, exc)
             finally:
                 writer.close()
                 with suppress(Exception):
@@ -469,13 +499,134 @@ class VMLifecycleManager:
                     await asyncio.sleep(0.5)
                     finished_signal.set()
                 asyncio.create_task(_signal())
-            print(f"GUEST TELEMETRY: {text}", flush=True)
 
         async def on_log_line(text: str) -> None:
             log_lines.append(text)
-            detector.observe_line(text)
+            parsed_event = None
+            if text.startswith("{"):
+                with suppress(json.JSONDecodeError):
+                    parsed_event = json.loads(text)
+
+                if parsed_event and isinstance(parsed_event, dict):
+                event_type = parsed_event.get("event")
+                    if event_type in {
+                    "syscall_event",
+                    "process_start",
+                    "process_exit",
+                    "network_event",
+                    "file_event",
+                    "dns_event",
+                    "artifact_created",
+                    "credential_event",
+                    "ipc_event",
+                    "mmap_event",
+                }:
+                        # Snapshot IOC lists to detect new hits from this event
+                        before_counts = (
+                            len(detector.network_iocs),
+                            len(detector.process_iocs),
+                            len(detector.file_iocs),
+                            len(detector.dns_iocs),
+                            len(detector.crypto_iocs),
+                        )
+                        detector.observe_event(parsed_event)
+                        after_counts = (
+                            len(detector.network_iocs),
+                            len(detector.process_iocs),
+                            len(detector.file_iocs),
+                            len(detector.dns_iocs),
+                            len(detector.crypto_iocs),
+                        )
+                        # If any of the IOC lists grew, persist the raw line as suspicious
+                        if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
+                            categories = []
+                            if after_counts[0] > before_counts[0]:
+                                categories.append("network")
+                            if after_counts[1] > before_counts[1]:
+                                categories.append("process")
+                            if after_counts[2] > before_counts[2]:
+                                categories.append("file")
+                            if after_counts[3] > before_counts[3]:
+                                categories.append("dns")
+                            if after_counts[4] > before_counts[4]:
+                                categories.append("crypto")
+                            category = ",".join(categories) if categories else None
+                            with suppress(Exception):
+                                await self._persistence.write_suspicious_line(job_id, text, category=category)
+                    cleaned = _clean_runtime_event(parsed_event)
+                    if cleaned is not None:
+                        relevant_runtime_events.append(cleaned)
+                        _accumulate_runtime_summary(relevant_runtime_summary, cleaned)
+                elif event_type in {"stdio_line", "log_line", "raw_runtime_line"}:
+                    payload_text = parsed_event.get("message")
+                    if not isinstance(payload_text, str) or not payload_text:
+                        payload_text = parsed_event.get("line")
+                    if isinstance(payload_text, str) and payload_text:
+                        # Snapshot IOC lists to detect new hits from this line
+                        before_counts = (
+                            len(detector.network_iocs),
+                            len(detector.process_iocs),
+                            len(detector.file_iocs),
+                            len(detector.dns_iocs),
+                            len(detector.crypto_iocs),
+                        )
+                        detector.observe_line(payload_text)
+                        after_counts = (
+                            len(detector.network_iocs),
+                            len(detector.process_iocs),
+                            len(detector.file_iocs),
+                            len(detector.dns_iocs),
+                            len(detector.crypto_iocs),
+                        )
+                        if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
+                            categories = []
+                            if after_counts[0] > before_counts[0]:
+                                categories.append("network")
+                            if after_counts[1] > before_counts[1]:
+                                categories.append("process")
+                            if after_counts[2] > before_counts[2]:
+                                categories.append("file")
+                            if after_counts[3] > before_counts[3]:
+                                categories.append("dns")
+                            if after_counts[4] > before_counts[4]:
+                                categories.append("crypto")
+                            category = ",".join(categories) if categories else None
+                            with suppress(Exception):
+                                await self._persistence.write_suspicious_line(job_id, payload_text, category=category)
+            else:
+                # Raw text path: snapshot+observe+persist if new IOCs found
+                before_counts = (
+                    len(detector.network_iocs),
+                    len(detector.process_iocs),
+                    len(detector.file_iocs),
+                    len(detector.dns_iocs),
+                    len(detector.crypto_iocs),
+                )
+                detector.observe_line(text)
+                after_counts = (
+                    len(detector.network_iocs),
+                    len(detector.process_iocs),
+                    len(detector.file_iocs),
+                    len(detector.dns_iocs),
+                    len(detector.crypto_iocs),
+                )
+                if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
+                    categories = []
+                    if after_counts[0] > before_counts[0]:
+                        categories.append("network")
+                    if after_counts[1] > before_counts[1]:
+                        categories.append("process")
+                    if after_counts[2] > before_counts[2]:
+                        categories.append("file")
+                    if after_counts[3] > before_counts[3]:
+                        categories.append("dns")
+                    if after_counts[4] > before_counts[4]:
+                        categories.append("crypto")
+                    category = ",".join(categories) if categories else None
+                    with suppress(Exception):
+                        await self._persistence.write_suspicious_line(job_id, text, category=category)
+
             logger.debug("[%s][log] %s", job_id, text[:200])
-            print(f"GUEST LOG: {text}", flush=True)
 
         # Remove stale sockets
         for sock_path in (workspace.telemetry_socket, workspace.log_socket):
@@ -659,3 +810,115 @@ class VMLifecycleManager:
             if chunk == b"\n":
                 break
         return bytes(buf)
+
+
+def _clean_runtime_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = event.get("event")
+    ts = event.get("ts")
+    if event_type == "syscall_event":
+        return {
+            "ts": ts,
+            "event": event_type,
+            "phase": event.get("phase"),
+            "pid": event.get("pid"),
+            "ppid": event.get("ppid"),
+            "syscall": event.get("syscall"),
+            "args": event.get("args", []),
+            "return_value": event.get("return_value"),
+        }
+    if event_type == "process_start":
+        return {
+            "ts": ts,
+            "event": event_type,
+            "phase": event.get("phase"),
+            "pid": event.get("pid"),
+            "ppid": event.get("ppid"),
+            "binary": event.get("binary"),
+            "args": event.get("args", []),
+            "cwd": event.get("cwd"),
+            "late_spawn": event.get("late_spawn", False),
+        }
+    if event_type == "process_exit":
+        return {
+            "ts": ts,
+            "event": event_type,
+            "phase": event.get("phase"),
+            "pid": event.get("pid"),
+            "ppid": event.get("ppid"),
+            "return_value": event.get("return_value"),
+            "lifetime_seconds": event.get("lifetime_seconds"),
+        }
+    if event_type == "network_event":
+        return {
+            "ts": ts,
+            "event": event_type,
+            "phase": event.get("phase"),
+            "pid": event.get("pid"),
+            "ppid": event.get("ppid"),
+            "action": event.get("action"),
+            "fd": event.get("fd"),
+            "ip": event.get("ip"),
+            "port": event.get("port"),
+            "protocol": event.get("protocol"),
+            "family": event.get("family"),
+            "payload_size": event.get("payload_size"),
+            "failed": event.get("failed", False),
+        }
+    if event_type == "file_event":
+        return {
+            "ts": ts,
+            "event": event_type,
+            "phase": event.get("phase"),
+            "pid": event.get("pid"),
+            "ppid": event.get("ppid"),
+            "operation": event.get("operation"),
+            "access_type": event.get("access_type"),
+            "path": event.get("path"),
+            "target_path": event.get("target_path"),
+            "fd": event.get("fd"),
+            "size": event.get("size"),
+            "return_value": event.get("return_value"),
+        }
+    if event_type == "dns_event":
+        return {
+            "ts": ts,
+            "event": event_type,
+            "phase": event.get("phase"),
+            "pid": event.get("pid"),
+            "ppid": event.get("ppid"),
+            "syscall": event.get("syscall"),
+            "port": event.get("port"),
+        }
+    if event_type == "artifact_created":
+        return {
+            "ts": ts,
+            "event": event_type,
+            "phase": event.get("phase"),
+            "pid": event.get("pid"),
+            "kind": event.get("kind"),
+            "path": event.get("path"),
+            "size": event.get("size"),
+            "age_seconds": event.get("age_seconds"),
+        }
+    return None
+
+
+def _accumulate_runtime_summary(summary: dict[str, Any], event: dict[str, Any]) -> None:
+    summary["event_count"] = int(summary.get("event_count", 0)) + 1
+    event_type = event.get("event")
+    if event_type == "syscall_event":
+        summary["syscall_count"] = int(summary.get("syscall_count", 0)) + 1
+    elif event_type in {"process_start", "process_exit"}:
+        summary["process_count"] = int(summary.get("process_count", 0)) + 1
+    elif event_type == "network_event":
+        summary["network_count"] = int(summary.get("network_count", 0)) + 1
+    elif event_type == "file_event":
+        summary["file_count"] = int(summary.get("file_count", 0)) + 1
+    elif event_type == "dns_event":
+        summary["dns_count"] = int(summary.get("dns_count", 0)) + 1
+    elif event_type == "artifact_created":
+        summary["artifact_count"] = int(summary.get("artifact_count", 0)) + 1
+
+    events = summary.setdefault("events", [])
+    if isinstance(events, list) and len(events) < 250:
+        events.append(event)

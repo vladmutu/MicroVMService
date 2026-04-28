@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
     app.state.persistence = persistence
 
     # 2. VM Lifecycle Manager
-    lifecycle = VMLifecycleManager(settings)
+    lifecycle = VMLifecycleManager(settings, persistence=persistence)
     app.state.lifecycle = lifecycle
 
     # 3. Analysis Engine

@@ -130,6 +130,20 @@ class PostgresPersistence:
             job_id, datetime.now(UTC), source, level, message,
         )
 
+    async def write_suspicious_line(self, job_id: str, line: str, category: str | None = None) -> None:
+        """
+        Store a single suspicious line observed by the IOC detector for later review.
+        """
+        if self._pool is None:
+            return
+        await self._pool.execute(
+            """
+            INSERT INTO analysis_suspicious_lines (job_id, observed_at, category, line)
+            VALUES ($1, $2, $3, $4)
+            """,
+            job_id, datetime.now(UTC), category or "", line,
+        )
+
     async def write_verdict(
         self,
         job_id: str,
@@ -149,6 +163,46 @@ class PostgresPersistence:
             job_id, verdict, risk_score,
             json.dumps(evidence, separators=(",", ":")),
             datetime.now(UTC),
+        )
+
+    async def write_relevant_runtime_events(
+        self,
+        job_id: str,
+        summary: dict[str, Any],
+        events: list[dict[str, Any]],
+    ) -> None:
+        """Store cleaned, malware-relevant runtime telemetry for later review."""
+        if self._pool is None:
+            return
+        await self._pool.execute(
+            """
+            INSERT INTO analysis_relevant_runtime_events
+                (job_id, created_at, event_count, syscall_count, process_count, network_count,
+                 file_count, dns_count, artifact_count, summary, events)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
+            ON CONFLICT (job_id) DO UPDATE
+            SET created_at = EXCLUDED.created_at,
+                event_count = EXCLUDED.event_count,
+                syscall_count = EXCLUDED.syscall_count,
+                process_count = EXCLUDED.process_count,
+                network_count = EXCLUDED.network_count,
+                file_count = EXCLUDED.file_count,
+                dns_count = EXCLUDED.dns_count,
+                artifact_count = EXCLUDED.artifact_count,
+                summary = EXCLUDED.summary,
+                events = EXCLUDED.events
+            """,
+            job_id,
+            datetime.now(UTC),
+            int(summary.get("event_count", len(events))),
+            int(summary.get("syscall_count", 0)),
+            int(summary.get("process_count", 0)),
+            int(summary.get("network_count", 0)),
+            int(summary.get("file_count", 0)),
+            int(summary.get("dns_count", 0)),
+            int(summary.get("artifact_count", 0)),
+            json.dumps(summary, separators=(",", ":")),
+            json.dumps(events, separators=(",", ":")),
         )
 
     # ── Read operations ───────────────────────────────────────────────
@@ -234,6 +288,21 @@ class PostgresPersistence:
                 created_at TIMESTAMPTZ NOT NULL
             )
         """)
+        await self._pool.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_relevant_runtime_events (
+                job_id TEXT PRIMARY KEY REFERENCES analysis_jobs(job_id),
+                created_at TIMESTAMPTZ NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                syscall_count INTEGER NOT NULL DEFAULT 0,
+                process_count INTEGER NOT NULL DEFAULT 0,
+                network_count INTEGER NOT NULL DEFAULT 0,
+                file_count INTEGER NOT NULL DEFAULT 0,
+                dns_count INTEGER NOT NULL DEFAULT 0,
+                artifact_count INTEGER NOT NULL DEFAULT 0,
+                summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                events JSONB NOT NULL DEFAULT '[]'::jsonb
+            )
+        """)
 
         # Indexes for common queries
         await self._pool.execute("""
@@ -244,6 +313,24 @@ class PostgresPersistence:
         """)
         await self._pool.execute("""
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON analysis_jobs(status)
+        """)
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_relevant_runtime_events_job_id ON analysis_relevant_runtime_events(job_id)
+        """)
+
+        # Table for storing individual suspicious lines observed during analysis
+        await self._pool.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_suspicious_lines (
+                id BIGSERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL REFERENCES analysis_jobs(job_id),
+                observed_at TIMESTAMPTZ NOT NULL,
+                category TEXT,
+                line TEXT NOT NULL
+            )
+        """)
+
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_suspicious_lines_job_id ON analysis_suspicious_lines(job_id)
         """)
 
         logger.info("PostgreSQL schema verified")

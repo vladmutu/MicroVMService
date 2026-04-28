@@ -114,5 +114,34 @@ def test_partial_on_global_timeout(client) -> None:
     assert data["timed_out"] is True
 
 
+def test_firecracker_timeout_maps_to_partial(client) -> None:
+    payload = {
+        "ecosystem": "pypi",
+        "package_name": "requests",
+        "package_version": "2.32.3",
+        "sandbox_type": "firecracker",
+        "firecracker_config": {
+            "kernel_path": "/opt/firecracker/vmlinux",
+            "rootfs_path": "/opt/firecracker/rootfs.ext4",
+        },
+    }
+
+    mock_result = _make_mock_result(verdict="benign")
+    mock_result.error = "analysis timed out"
+
+    with patch(
+        "app.services.sandbox.vm_lifecycle.VMLifecycleManager.run_analysis",
+        new_callable=AsyncMock,
+        return_value=mock_result,
+    ):
+        response = client.post("/analyze", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "partial"
+    assert data["coverage"] == "partial"
+    assert data["timed_out"] is True
+
+
 def test_health_endpoints(client) -> None:
     assert client.get("/healthz").status_code == 200
