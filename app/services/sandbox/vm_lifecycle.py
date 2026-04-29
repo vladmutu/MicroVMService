@@ -298,10 +298,7 @@ class VMLifecycleManager:
             logger.info("[%s] Job delivered to guest", job_id)
 
             # 8. Wait for agent_finished signal
-            await asyncio.wait_for(
-                finished_signal.wait(),
-                timeout=self._settings.vm_analysis_timeout_seconds,
-            )
+            await finished_signal.wait()
             logger.info("[%s] Agent finished", job_id)
 
             # 9. Build evidence
@@ -486,13 +483,9 @@ class VMLifecycleManager:
                     await writer.wait_closed()
 
         async def on_telemetry_line(text: str) -> None:
-            try:
-                event = json.loads(text)
-            except json.JSONDecodeError:
-                event = {"event": "invalid_json", "raw": text, "job_id": job_id}
-            telemetry_events.append(event)
+            telemetry_events.append({"raw": text})
             logger.debug("[%s][telemetry] %s", job_id, text[:200])
-            if event.get("event") in {"agent_finished", "verdict"}:
+            if " agent_finished " in text or " verdict " in text or text.endswith(" agent_finished") or text.endswith(" verdict"):
                 # Give a short delay to allow log_lines from vsock port 7002 to flush
                 # before setting finished_signal and tearing down the VM.
                 async def _signal() -> None:
@@ -502,10 +495,6 @@ class VMLifecycleManager:
 
         async def on_log_line(text: str) -> None:
             log_lines.append(text)
-            parsed_event = None
-            if text.startswith("{"):
-                with suppress(json.JSONDecodeError):
-                    parsed_event = json.loads(text)
 
             async def _persist_ioc_delta(payload_text: str, before_counts: tuple[int, int, int, int, int], after_counts: tuple[int, int, int, int, int]) -> None:
                 if not self._persistence or not any(a > b for a, b in zip(after_counts, before_counts)):
@@ -525,88 +514,24 @@ class VMLifecycleManager:
                 with suppress(Exception):
                     await self._persistence.write_suspicious_line(job_id, payload_text, category=category)
 
-            if parsed_event and isinstance(parsed_event, dict):
-                event_type = parsed_event.get("event")
-                if event_type in {"agent_finished", "verdict"}:
-                    # Fallback completion signal if telemetry channel misses the finish event.
-                    finished_signal.set()
-                # Structured event path: observe but do NOT persist IOCs from metadata events
-                if event_type in {
-                    "syscall_event",
-                    "process_start",
-                    "process_exit",
-                    "network_event",
-                    "file_event",
-                    "dns_event",
-                    "artifact_created",
-                    "credential_event",
-                    "ipc_event",
-                    "mmap_event",
-                }:
-                    before_counts = (
-                        len(detector.network_iocs),
-                        len(detector.process_iocs),
-                        len(detector.file_iocs),
-                        len(detector.dns_iocs),
-                        len(detector.crypto_iocs),
-                    )
-                    detector.observe_event(parsed_event)
-                    after_counts = (
-                        len(detector.network_iocs),
-                        len(detector.process_iocs),
-                        len(detector.file_iocs),
-                        len(detector.dns_iocs),
-                        len(detector.crypto_iocs),
-                    )
-                    await _persist_ioc_delta(
-                        json.dumps(parsed_event, separators=(",", ":"), default=str),
-                        before_counts,
-                        after_counts,
-                    )
-                    cleaned = _clean_runtime_event(parsed_event)
-                    if cleaned is not None:
-                        relevant_runtime_events.append(cleaned)
-                        _accumulate_runtime_summary(relevant_runtime_summary, cleaned)
-                # Only persist IOCs for agent logs (stdio/log/raw output), not structured events
-                elif event_type in {"stdio_line", "log_line", "raw_runtime_line"}:
-                    payload_text = parsed_event.get("message")
-                    if not isinstance(payload_text, str) or not payload_text:
-                        payload_text = parsed_event.get("line")
-                    if isinstance(payload_text, str) and payload_text:
-                        before_counts = (
-                            len(detector.network_iocs),
-                            len(detector.process_iocs),
-                            len(detector.file_iocs),
-                            len(detector.dns_iocs),
-                            len(detector.crypto_iocs),
-                        )
-                        detector.observe_line(payload_text)
-                        after_counts = (
-                            len(detector.network_iocs),
-                            len(detector.process_iocs),
-                            len(detector.file_iocs),
-                            len(detector.dns_iocs),
-                            len(detector.crypto_iocs),
-                        )
-                        await _persist_ioc_delta(payload_text, before_counts, after_counts)
-            else:
-                # Raw text path: persist if it creates new IOC evidence.
-                before_counts = (
-                    len(detector.network_iocs),
-                    len(detector.process_iocs),
-                    len(detector.file_iocs),
-                    len(detector.dns_iocs),
-                    len(detector.crypto_iocs),
-                )
-                detector.observe_line(text)
-                after_counts = (
-                    len(detector.network_iocs),
-                    len(detector.process_iocs),
-                    len(detector.file_iocs),
-                    len(detector.dns_iocs),
-                    len(detector.crypto_iocs),
-                )
-                await _persist_ioc_delta(text, before_counts, after_counts)
+            before_counts = (
+                len(detector.network_iocs),
+                len(detector.process_iocs),
+                len(detector.file_iocs),
+                len(detector.dns_iocs),
+                len(detector.crypto_iocs),
+            )
+            
+            detector.observe_line(text)
+            
+            after_counts = (
+                len(detector.network_iocs),
+                len(detector.process_iocs),
+                len(detector.file_iocs),
+                len(detector.dns_iocs),
+                len(detector.crypto_iocs),
+            )
+            await _persist_ioc_delta(text, before_counts, after_counts)
 
             logger.debug("[%s][log] %s", job_id, text[:200])
 

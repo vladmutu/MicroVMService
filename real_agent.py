@@ -117,10 +117,10 @@ _TRACE_SYSCALLS: list[str] = [
     "access", "faccessat",
     "getcwd", "chdir", "fchdir",
     # --- credentials ---
+    # credentials (safe modern subset)
     "getuid", "geteuid", "getgid", "getegid",
-    "setuid", "seteuid", "setgid", "setegid",
-    "setresuid", "setresgid", "getresuid", "getresgid",
-    "capget", "capset", "prctl",
+    "setresuid", "setresgid",
+    "capget", "capset", "prctl"
     # --- ipc / misc ---
     "ptrace", "pipe", "pipe2", "dup", "dup2", "dup3", "fcntl", "ioctl",
     "syslog", "sched_setaffinity", "memfd_create",
@@ -340,7 +340,7 @@ class StdioRouter:
 # Ingress: receive framed job over vsock 7000
 # ---------------------------------------------------------------------------
 
-def receive_job() -> tuple[dict[str, Any], bytes]:
+def receive_job() -> tuple[dict[str, Any], str, int]:
     srv = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -368,14 +368,35 @@ def receive_job() -> tuple[dict[str, Any], bytes]:
     header: dict[str, Any] = json.loads(header_line.decode())
     artifact_size = int(header.get("artifact_size", 0))
 
-    artifact = leftover
-    while len(artifact) < artifact_size:
-        chunk = conn.recv(min(65536, artifact_size - len(artifact)))
-        if not chunk:
-            break
-        artifact += chunk
-    artifact = artifact[:artifact_size]
+    # --- STREAM TO DISK FIX ---
+    global ARTIFACT_PATH
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    ARTIFACT_PATH = WORK_DIR / "artifact.pkg"
+    
+    hasher = hashlib.sha256()
+    bytes_received = 0
 
+    # Open the file in write-binary mode
+    with ARTIFACT_PATH.open("wb") as f:
+        # 1. Write the initial payload that spilled over from the header split
+        if leftover:
+            initial_data = leftover[:artifact_size]
+            f.write(initial_data)
+            hasher.update(initial_data) # Hash on the fly
+            bytes_received += len(initial_data)
+
+        # 2. Stream the rest directly from the socket to the disk
+        while bytes_received < artifact_size:
+            chunk = conn.recv(min(65536, artifact_size - bytes_received))
+            if not chunk:
+                break
+            f.write(chunk)
+            hasher.update(chunk) # Hash on the fly
+            bytes_received += len(chunk)
+
+    actual_sha256 = hasher.hexdigest()
+
+    # --- DRAIN AND CLOSE ---
     conn.settimeout(0.3)
     try:
         while conn.recv(4096):
@@ -389,8 +410,8 @@ def receive_job() -> tuple[dict[str, Any], bytes]:
         pass
     conn.close()
     srv.close()
-    return header, artifact
-
+    
+    return header, actual_sha256, bytes_received
 
 # ---------------------------------------------------------------------------
 # Artifact handling
@@ -470,71 +491,91 @@ def _pump_stdout(
         log.stdout_line(line.rstrip("\n"), phase=phase)
 
 
-def run_with_strace(
-    cmd: list[str],
+def _run_strace_once(strace_cmd, log_path):
+    return subprocess.Popen(
+        strace_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+
+def run_with_strace(cmd: list[str],
     log_path: Path,
     log: LogStream,
     tel: Telemetry,
     phase: str,
     timeout: int,
-) -> int:
-    strace_cmd = [
+):
+    base_cmd = [
         _BIN["strace"],
-        "-f",                          # follow forks
-        "-v",                          # verbose struct decoding
-        "-s", "65535",                 # full string capture
-        "-y",                          # resolve fd → path
-        "-yy",                         # also resolve socket addresses
-        "--timestamps=unix,us",        # microsecond UNIX timestamps
+        "-f",
+        "-v",
+        "-s", "65535",
+        "-y",
+        "-yy",
+        "--timestamps=unix,us",
         "-e", f"trace={TRACE_SYSCALLS_ARG}",
         "-o", str(log_path),
     ] + cmd
 
-    try:
-        proc = subprocess.Popen(
-            strace_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-    except FileNotFoundError:
-        log.warning("strace not found — running without tracing")
-        tel.emit("warning", message="strace_not_found", cmd=" ".join(cmd))
-        try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=timeout,
-            )
-            for line in (result.stdout or "").splitlines():
-                log.stdout_line(line, phase=phase)
-            return result.returncode or 0
-        except subprocess.TimeoutExpired:
-            return -1
+    proc = _run_strace_once(base_cmd, log_path)
+    output_buffer = []
 
-    tailer = threading.Thread(
-        target=_tail_strace_log,
-        args=(log_path, proc, log, phase),
-        daemon=True,
-    )
-    pumper = threading.Thread(
-        target=_pump_stdout,
-        args=(proc.stdout, log, phase),
-        daemon=True,
-    )
-    tailer.start()
-    pumper.start()
+    def collect_output():
+        if proc.stdout:
+            for line in proc.stdout:
+                output_buffer.append(line)
+
+    t = threading.Thread(target=collect_output, daemon=True)
+    t.start()
 
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        log.warning(f"strace_timeout phase={phase} timeout={timeout}s cmd={cmd}")
-        tel.emit("strace_timeout", phase=phase, timeout_seconds=timeout)
+        log.warning(f"Process timed out after {timeout}s, terminating...")
+        tel.emit("process_timeout", phase=phase)
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
-    tailer.join(timeout=3.0)
-    pumper.join(timeout=3.0)
+    t.join(timeout=2)
+
+    combined_output = "".join(output_buffer)
+
+    if "invalid system call" in combined_output:
+        log.warning("strace syscall filter invalid — falling back to trace=all")
+        tel.emit("strace_fallback_triggered", phase=phase)
+
+        # fallback command (NO syscall filtering)
+        # fallback command (NO syscall filtering)
+        fallback_cmd = [
+            _BIN["strace"],
+            "-f",
+            "-v",
+            "-s", "65535",
+            "-y",
+            "-yy",
+            "--timestamps=unix,us",
+            "-e", "trace=all",
+            "-o", str(log_path),
+        ] + cmd
+
+        proc = _run_strace_once(fallback_cmd, log_path)
+        
+        # --- Add this try/except block ---
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log.warning(f"Fallback process timed out after {timeout}s, terminating...")
+            tel.emit("process_timeout_fallback", phase=phase)
+            proc.kill()
+            proc.wait()
+
     return proc.returncode or 0
 
 
@@ -726,7 +767,8 @@ def phase_ambient_monitor(
 
 def main() -> None:
     print("[agent] started, waiting for job on port 7000", flush=True)
-    header, artifact_bytes = receive_job()
+    # Get the hash and bytes directly from the ingress function
+    header, actual_sha256, bytes_received = receive_job()
     print(f"[agent] job received: {header.get('job_id')}", flush=True)
 
     job_id: str = header.get("job_id", "unknown")
@@ -766,16 +808,20 @@ def main() -> None:
         # Phase 1 — Artifact ingress
         # ------------------------------------------------------------------
         log.debug("phase_artifact_ingress_started")
-        has_artifact = artifact_size > 0 and len(artifact_bytes) == artifact_size
+        
+        # Verify we received exactly what we expected
+        has_artifact = artifact_size > 0 and bytes_received == artifact_size
 
         if has_artifact:
-            hash_ok = save_and_verify_artifact(artifact_bytes, expected_sha256, job_type)
-            actual_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+            # Check the hash we computed on-the-fly against the expected hash
+            hash_ok = (not expected_sha256) or (actual_sha256 == expected_sha256)
+            
             if not hash_ok:
                 log.warning(f"hash_mismatch expected={expected_sha256} actual={actual_sha256}")
                 tel.emit("artifact_hash_mismatch", expected=expected_sha256, actual=actual_sha256)
             else:
-                tel.emit("artifact_received", size=len(artifact_bytes), sha256=actual_sha256)
+                tel.emit("artifact_received", size=bytes_received, sha256=actual_sha256)
+            
             extract_artifact()
             log.debug(f"artifact_extracted to={EXTRACT_DIR}")
         else:

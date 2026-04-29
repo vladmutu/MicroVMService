@@ -92,7 +92,7 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
             coverage=outcome.coverage,
             risk_score=outcome.risk_score,
             provider=settings.provider_name,
-            job_id=engine.build_job_id(body),
+            job_id=outcome.job_id,
             timed_out=outcome.timed_out,
             vm_evasion_observed=outcome.vm_evasion_observed,
             syscall_trace=(
@@ -172,7 +172,7 @@ async def analyze_upload(
             coverage=outcome.coverage,
             risk_score=outcome.risk_score,
             provider=settings.provider_name,
-            job_id=engine.build_job_id(body),
+            job_id=outcome.job_id,
             timed_out=outcome.timed_out,
             vm_evasion_observed=outcome.vm_evasion_observed,
             syscall_trace=(

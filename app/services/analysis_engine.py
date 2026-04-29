@@ -37,6 +37,7 @@ class AnalysisOutcome:
     timed_out: bool
     vm_evasion_observed: bool
     telemetry: Telemetry
+    job_id: str
     evidence: dict[str, Any] = field(default_factory=dict)
 
 
@@ -65,7 +66,7 @@ class AnalysisEngine:
     def build_job_id(request: AnalyzeRequest) -> str:
         # Generate a unique job_id for each run using UUID
         # This ensures the same package analyzed multiple times gets different job_ids
-        return str(uuid.uuid4())[:24]
+        return str(uuid.uuid4())
 
     async def analyze(self, request: AnalyzeRequest, artifact_bytes: bytes | None = None) -> AnalysisOutcome:
         job_id = self.build_job_id(request)
@@ -80,10 +81,7 @@ class AnalysisEngine:
         )
 
         try:
-            outcome = await asyncio.wait_for(
-                self._analyze_inner(request, job_id, artifact_bytes),
-                timeout=self._settings.analysis_timeout_seconds,
-            )
+            outcome = await self._analyze_inner(request, job_id, artifact_bytes)
         except (asyncio.TimeoutError, TimeoutError):
             telemetry = Telemetry(timed_out=True).normalized()
             await self._persistence.write_log(job_id, "host", "warning", "analysis timed out")
@@ -95,6 +93,7 @@ class AnalysisEngine:
                 timed_out=True,
                 vm_evasion_observed=False,
                 telemetry=telemetry,
+                job_id=job_id,
             )
 
         return outcome
@@ -200,6 +199,7 @@ class AnalysisEngine:
                 timed_out=telemetry.timed_out,
                 vm_evasion_observed=telemetry.vm_evasion_observed,
                 telemetry=telemetry,
+                job_id=job_id,
                 evidence=evidence,
             )
 
@@ -211,6 +211,7 @@ class AnalysisEngine:
                 status="partial", coverage="partial",
                 risk_score=normalize_risk_score(telemetry, "partial"),
                 timed_out=True, vm_evasion_observed=False, telemetry=telemetry,
+                job_id=job_id,
             )
 
         except (PackageResolutionError, SandboxInfraError, AnalysisError) as exc:
@@ -221,6 +222,7 @@ class AnalysisEngine:
                 status="failed", coverage="none",
                 risk_score=None,
                 timed_out=False, vm_evasion_observed=False, telemetry=telemetry,
+                job_id=job_id,
             )
 
     @staticmethod

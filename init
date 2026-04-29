@@ -1,42 +1,58 @@
 #!/bin/sh
-# /sbin/init — Firecracker microVM init script
+# /sbin/init — minimal Firecracker microVM init
 
-# THE FIX: Tell the system where binaries live
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
 
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev 2>/dev/null || true
-mkdir -p /dev/pts
-mount -t devpts none /dev/pts 2>/dev/null || true
+echo "[init] booting..." > /dev/console
 
-# Bring up loopback
+# --- Mount core filesystems ---
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
+# --- Fix critical device nodes ---
+[ -e /dev/null ] || mknod -m 666 /dev/null c 1 3
+chmod 666 /dev/null
+
+# --- Pseudo terminals ---
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts -o mode=620,ptmxmode=666 2>/dev/null || true
+
+# --- tmp (agent workspace) ---
+mkdir -p /tmp
+chmod 1777 /tmp
+
+# --- Network ---
 ip link set lo up
 
-# Network setup — the host passes ip= via kernel boot args which
-# auto-configures eth0.  If that didn't work (CONFIG_IP_PNP missing),
-# fall back to a static configuration.
 if ! ip addr show eth0 2>/dev/null | grep -q "inet "; then
-    echo "[init] Kernel ip= not applied, configuring network manually..." > /dev/console
+    echo "[init] configuring eth0..." > /dev/console
     ip link set eth0 up 2>/dev/null || true
     ip addr add 172.16.0.2/30 dev eth0 2>/dev/null || true
     ip route add default via 172.16.0.1 2>/dev/null || true
 fi
 
-# DNS resolution
+# --- DNS ---
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
-echo "[init] Launching agent..." > /dev/console
+# --- Sanity debug (optional, remove later) ---
+echo "[init] network ready:" > /dev/console
+ip addr > /dev/console 2>&1
 
-# Run agent in foreground — when it exits, poweroff
+# --- Run agent ---
+echo "[init] launching agent..." > /dev/console
+
+# If using Python:
 python3 -u /opt/agent.py > /dev/console 2>&1
+
+# OR if using Node:
+# node /app/index.js > /dev/console 2>&1
+
 AGENT_EXIT=$?
 
-echo "[init] Agent exited with code $AGENT_EXIT, powering off..." > /dev/console
+echo "[init] agent exited ($AGENT_EXIT)" > /dev/console
 
-# Give a moment for vsock buffers to flush
+# --- Graceful shutdown ---
+sync
 sleep 1
-
-# Clean shutdown — Firecracker will see the VM exit
 poweroff -f
-EOF
