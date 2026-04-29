@@ -69,6 +69,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -472,22 +473,42 @@ def receive_job() -> tuple[dict[str, Any], str, int]:
 # Artifact handling
 # ---------------------------------------------------------------------------
 
-def extract_artifact() -> None:
-    """Extract the artifact to EXTRACT_DIR."""
-    EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+def detect_and_normalize_artifact(path: Path) -> Path | None:
     try:
-        name = ARTIFACT_PATH.name.lower()
-        if name.endswith(".whl") or name.endswith(".zip") or zipfile.is_zipfile(str(ARTIFACT_PATH)):
-            with zipfile.ZipFile(str(ARTIFACT_PATH)) as zf:
-                try:
-                    zf.extractall(str(EXTRACT_DIR), pwd=b"infected")
-                except RuntimeError:
-                    zf.extractall(str(EXTRACT_DIR))
-        elif tarfile.is_tarfile(str(ARTIFACT_PATH)):
-            with tarfile.open(str(ARTIFACT_PATH)) as tf:
-                tf.extractall(str(EXTRACT_DIR))
-    except Exception as exc:
-        print(f"[agent] extraction failed: {exc}", flush=True)
+        with path.open("rb") as fh:
+            head = fh.read(4096)
+
+        new_ext = None
+
+        # ZIP / WHEEL
+        if head.startswith(b"PK"):
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    names = zf.namelist()
+                    if any(".dist-info/" in n for n in names):
+                        new_ext = ".whl"
+                    else:
+                        new_ext = ".zip"
+            except Exception:
+                new_ext = ".zip"
+
+        # GZIP (tar.gz / tgz)
+        elif head.startswith(b"\x1f\x8b"):
+            new_ext = ".tar.gz"
+
+        # Optional fallback
+        elif tarfile.is_tarfile(path):
+            new_ext = ".tar"
+
+        if new_ext:
+            new_path = path.with_suffix(new_ext)
+            path.replace(new_path)
+            return new_path
+
+        return None
+
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +670,12 @@ def run_with_strace(
 # ---------------------------------------------------------------------------
 
 def _find_npm_pkg_dir() -> Path:
-    """Find package.json directory in extracted artifact."""
+    """Find package.json directory in extracted artifact.
+
+    Extraction is no longer performed; this helper returns EXTRACT_DIR
+    for compatibility, but callers should prefer installing the artifact
+    file directly when present.
+    """
     pkg_jsons = sorted(EXTRACT_DIR.rglob("package.json"), key=lambda p: len(p.parts))
     return pkg_jsons[0].parent if pkg_jsons else EXTRACT_DIR / "package"
 
@@ -664,7 +690,8 @@ def build_install_command(job_type: str, package: str, has_artifact: bool) -> li
             return [_BIN["pip"], "install", "--no-cache-dir", "--no-deps", target]
         return [_BIN["pip"], "install", "--no-cache-dir", "--no-deps", package]
 
-    target = str(_find_npm_pkg_dir()) if has_artifact else package
+    # For npm, prefer installing directly from the artifact file when present.
+    target = str(ARTIFACT_PATH) if has_artifact else package
     return [_BIN["npm"], "install", "--no-fund", "--no-audit", target]
 
 
@@ -682,31 +709,15 @@ def find_entry_points(job_type: str, package: str) -> list[list[str]]:
         cmds.append([_BIN["python"], "-m", safe])
 
     elif job_type == "npm":
-        pkg_dir = _find_npm_pkg_dir()
-        index = pkg_dir / "index.js"
-        if index.exists():
-            cmds.append([_BIN["node"], str(index)])
-        pkg_json = pkg_dir / "package.json"
-        if pkg_json.exists():
-            try:
-                meta = json.loads(pkg_json.read_text(errors="replace"))
-                bins = meta.get("bin")
-                if isinstance(bins, str):
-                    cmds.append([_BIN["node"], str(pkg_dir / bins)])
-                elif isinstance(bins, dict):
-                    for script in bins.values():
-                        cmds.append([_BIN["node"], str(pkg_dir / script)])
-                main = meta.get("main")
-                if main:
-                    main_path = pkg_dir / main
-                    if main_path.exists() and [_BIN["node"], str(main_path)] not in cmds:
-                        cmds.append([_BIN["node"], str(main_path)])
-                scripts = meta.get("scripts", {})
-                postinstall = scripts.get("postinstall")
-                if postinstall:
-                    cmds.append(["/bin/sh", "-c", postinstall])
-            except Exception:
-                pass
+        # We no longer extract npm artifacts. Prefer simple runtime probes by
+        # attempting to require the installed package by name (if provided).
+        name = package.split("@")[0].split("==")[0]
+        safe = re.sub(r"[^a-zA-Z0-9_\-@/\\.]", "_", name)
+        if safe:
+            # Try a lightweight require check
+            cmds.append([_BIN["node"], "-e", f"require('{safe}'); console.log('require_ok')"]) 
+            # Also try executing package as a module
+            cmds.append([_BIN["node"], "-e", f"(async()=>{{try{{const m=require('{safe}'); if(m && m.main) console.log('has_main');}}catch(e){{}}}})();"])
 
     return cmds
 
@@ -727,12 +738,36 @@ def phase_install(
     log.marker("install", "start")
 
     install_cmd = build_install_command(job_type, package, has_artifact)
-    tel.emit("install_started", cmd=install_cmd)
     log.debug(f"install_cmd={install_cmd}")
+
+    # Create a per-job virtual environment under WORK_DIR/venv
+    venv_dir = WORK_DIR / "venv"
+    venv_created = False
+    try:
+        # Ensure parent exists
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        # Create venv using system python
+        subprocess.run([_BIN["python"], "-m", "venv", str(venv_dir)], check=True, timeout=20)
+        tel.emit("venv_created", path=str(venv_dir))
+        log.debug(f"venv created at {venv_dir}")
+        venv_created = True
+    except Exception as exc:
+        tel.emit("venv_creation_failed", error=str(exc).replace(" ", "%20"))
+        log.warning(f"venv creation failed: {exc}")
+
+    # If venv created, run install with activation so pip installs into it.
+    if venv_created:
+        quoted = " ".join(shlex.quote(p) for p in install_cmd)
+        shell_cmd = f"source {venv_dir}/bin/activate && {quoted}"
+        final_cmd = ["/bin/sh", "-c", shell_cmd]
+        tel.emit("install_started", cmd=["sh", "-c", shell_cmd])
+    else:
+        final_cmd = install_cmd
+        tel.emit("install_started", cmd=install_cmd)
 
     install_log = WORK_DIR / "strace_install.log"
     exit_code, timed_out, fallback_used = run_with_strace(
-        install_cmd, install_log, log, tel,
+        final_cmd, install_log, log, tel,
         phase="install", timeout=INSTALL_TIMEOUT,
     )
 
@@ -921,9 +956,14 @@ def main() -> None:
                 tel.emit("artifact_hash_mismatch", expected=expected_sha256, actual=actual_sha256)
             else:
                 tel.emit("artifact_received", size=bytes_received, sha256=actual_sha256)
-            
-            extract_artifact()
-            log.debug(f"artifact_extracted to={EXTRACT_DIR}")
+            # Try to normalize artifact filename to a sensible extension so
+            # pip/npm can consume it directly (e.g. .whl, .zip, .tar.gz).
+            ext = detect_and_normalize_artifact(ARTIFACT_PATH)
+            if ext:
+                tel.emit("artifact_normalized", ext=ext)
+                log.debug(f"artifact renamed to have ext={ext}")
+            else:
+                log.debug("artifact normalization skipped or unknown type")
         else:
             WORK_DIR.mkdir(parents=True, exist_ok=True)
             tel.emit("artifact_received", size=0, note="no_artifact_install_from_registry")
