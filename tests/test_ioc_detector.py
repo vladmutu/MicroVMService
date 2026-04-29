@@ -68,3 +68,20 @@ def test_benign_when_no_iocs() -> None:
     evidence = detector.build_evidence()
     assert evidence.verdict == "benign"
     assert not evidence.dynamic_hit
+
+
+def test_uploaded_artifact_is_informational_only() -> None:
+    detector = DynamicIOCDetector()
+    detector.observe_event(
+        {
+            "event": "artifact_created",
+            "kind": "uploaded_artifact",
+            "path": "/tmp/analysis/artifact.tgz",
+            "ts": 1.0,
+        }
+    )
+    evidence = detector.build_evidence()
+    assert evidence.verdict == "benign"
+    assert evidence.dynamic_hit is False
+    assert evidence.suspicious_syscalls == 0
+    assert "uploaded_artifact:/tmp/analysis/artifact.tgz" in evidence.file_iocs

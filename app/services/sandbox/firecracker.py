@@ -56,7 +56,7 @@ class FirecrackerSandboxRunner(SandboxRunner):
             syscall_categories.append("suspicious_exec")
         if ev.crypto_iocs:
             syscall_categories.append("crypto_mining")
-        if ev.file_iocs:
+        if any(not ioc.startswith("uploaded_artifact:") for ioc in ev.file_iocs):
             syscall_categories.append("sensitive_file_access")
 
         destinations: list[str] = []

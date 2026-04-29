@@ -549,7 +549,11 @@ class DynamicIOCDetector:
             self._append_unique(self.process_iocs, f"installer_shell_child:{ppid}->{pid}")
 
     def build_evidence(self) -> IOCEvidence:
-        has_hard_iocs = bool(self.network_iocs or self.process_iocs or self.file_iocs or self.crypto_iocs)
+        # uploaded_artifact markers are informational context, not malicious behavior by themselves
+        hard_file_iocs = [
+            ioc for ioc in self.file_iocs if not ioc.startswith("uploaded_artifact:")
+        ]
+        has_hard_iocs = bool(self.network_iocs or self.process_iocs or hard_file_iocs or self.crypto_iocs)
         near_certain = [
             self._reverse_shell_seen,
             self._anon_exec_mmap_seen,
@@ -611,7 +615,7 @@ class DynamicIOCDetector:
         dynamic_hit = bool(
             self.network_iocs
             or self.process_iocs
-            or self.file_iocs
+            or hard_file_iocs
             or self.dns_iocs
             or self.crypto_iocs
         )
@@ -626,7 +630,7 @@ class DynamicIOCDetector:
             crypto_iocs=list(self.crypto_iocs),
             raw_line_count=len(self.raw_lines),
             outbound_connections=self._count_unique_destinations(self.network_iocs),
-            suspicious_syscalls=len(self.process_iocs) + len(self.file_iocs) + len(self.dns_iocs),
+            suspicious_syscalls=len(self.process_iocs) + len(hard_file_iocs) + len(self.dns_iocs),
             sensitive_writes=len([ioc for ioc in self.file_iocs if ioc.startswith("persistence_path:") or ioc.startswith("sensitive_file:")]),
         )
 

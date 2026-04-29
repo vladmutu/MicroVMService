@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -62,10 +63,9 @@ class AnalysisEngine:
 
     @staticmethod
     def build_job_id(request: AnalyzeRequest) -> str:
-        digest = hashlib.sha256(
-            f"{request.ecosystem}:{request.package_name}:{request.package_version}:{request.sandbox_type}".encode()
-        ).hexdigest()
-        return digest[:24]
+        # Generate a unique job_id for each run using UUID
+        # This ensures the same package analyzed multiple times gets different job_ids
+        return str(uuid.uuid4())[:24]
 
     async def analyze(self, request: AnalyzeRequest, artifact_bytes: bytes | None = None) -> AnalysisOutcome:
         job_id = self.build_job_id(request)

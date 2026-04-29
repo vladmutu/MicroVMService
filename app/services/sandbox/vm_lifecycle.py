@@ -507,9 +507,30 @@ class VMLifecycleManager:
                 with suppress(json.JSONDecodeError):
                     parsed_event = json.loads(text)
 
+            async def _persist_ioc_delta(payload_text: str, before_counts: tuple[int, int, int, int, int], after_counts: tuple[int, int, int, int, int]) -> None:
+                if not self._persistence or not any(a > b for a, b in zip(after_counts, before_counts)):
+                    return
+                categories = []
+                if after_counts[0] > before_counts[0]:
+                    categories.append("network")
+                if after_counts[1] > before_counts[1]:
+                    categories.append("process")
+                if after_counts[2] > before_counts[2]:
+                    categories.append("file")
+                if after_counts[3] > before_counts[3]:
+                    categories.append("dns")
+                if after_counts[4] > before_counts[4]:
+                    categories.append("crypto")
+                category = ",".join(categories) if categories else None
+                with suppress(Exception):
+                    await self._persistence.write_suspicious_line(job_id, payload_text, category=category)
+
             if parsed_event and isinstance(parsed_event, dict):
                 event_type = parsed_event.get("event")
-                # Structured event path
+                if event_type in {"agent_finished", "verdict"}:
+                    # Fallback completion signal if telemetry channel misses the finish event.
+                    finished_signal.set()
+                # Structured event path: observe but do NOT persist IOCs from metadata events
                 if event_type in {
                     "syscall_event",
                     "process_start",
@@ -537,26 +558,16 @@ class VMLifecycleManager:
                         len(detector.dns_iocs),
                         len(detector.crypto_iocs),
                     )
-                    if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
-                        categories = []
-                        if after_counts[0] > before_counts[0]:
-                            categories.append("network")
-                        if after_counts[1] > before_counts[1]:
-                            categories.append("process")
-                        if after_counts[2] > before_counts[2]:
-                            categories.append("file")
-                        if after_counts[3] > before_counts[3]:
-                            categories.append("dns")
-                        if after_counts[4] > before_counts[4]:
-                            categories.append("crypto")
-                        category = ",".join(categories) if categories else None
-                        with suppress(Exception):
-                            await self._persistence.write_suspicious_line(job_id, text, category=category)
-
+                    await _persist_ioc_delta(
+                        json.dumps(parsed_event, separators=(",", ":"), default=str),
+                        before_counts,
+                        after_counts,
+                    )
                     cleaned = _clean_runtime_event(parsed_event)
                     if cleaned is not None:
                         relevant_runtime_events.append(cleaned)
                         _accumulate_runtime_summary(relevant_runtime_summary, cleaned)
+                # Only persist IOCs for agent logs (stdio/log/raw output), not structured events
                 elif event_type in {"stdio_line", "log_line", "raw_runtime_line"}:
                     payload_text = parsed_event.get("message")
                     if not isinstance(payload_text, str) or not payload_text:
@@ -577,23 +588,9 @@ class VMLifecycleManager:
                             len(detector.dns_iocs),
                             len(detector.crypto_iocs),
                         )
-                        if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
-                            categories = []
-                            if after_counts[0] > before_counts[0]:
-                                categories.append("network")
-                            if after_counts[1] > before_counts[1]:
-                                categories.append("process")
-                            if after_counts[2] > before_counts[2]:
-                                categories.append("file")
-                            if after_counts[3] > before_counts[3]:
-                                categories.append("dns")
-                            if after_counts[4] > before_counts[4]:
-                                categories.append("crypto")
-                            category = ",".join(categories) if categories else None
-                            with suppress(Exception):
-                                await self._persistence.write_suspicious_line(job_id, payload_text, category=category)
+                        await _persist_ioc_delta(payload_text, before_counts, after_counts)
             else:
-                # Raw text path: snapshot+observe+persist if new IOCs found
+                # Raw text path: persist if it creates new IOC evidence.
                 before_counts = (
                     len(detector.network_iocs),
                     len(detector.process_iocs),
@@ -609,21 +606,7 @@ class VMLifecycleManager:
                     len(detector.dns_iocs),
                     len(detector.crypto_iocs),
                 )
-                if self._persistence and any(a > b for a, b in zip(after_counts, before_counts)):
-                    categories = []
-                    if after_counts[0] > before_counts[0]:
-                        categories.append("network")
-                    if after_counts[1] > before_counts[1]:
-                        categories.append("process")
-                    if after_counts[2] > before_counts[2]:
-                        categories.append("file")
-                    if after_counts[3] > before_counts[3]:
-                        categories.append("dns")
-                    if after_counts[4] > before_counts[4]:
-                        categories.append("crypto")
-                    category = ",".join(categories) if categories else None
-                    with suppress(Exception):
-                        await self._persistence.write_suspicious_line(job_id, text, category=category)
+                await _persist_ioc_delta(text, before_counts, after_counts)
 
             logger.debug("[%s][log] %s", job_id, text[:200])
 
