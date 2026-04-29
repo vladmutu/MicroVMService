@@ -160,31 +160,32 @@ class Channel:
         self._lock = threading.Lock()
 
     def connect(self, retries: int = 15, delay: float = 0.5) -> None:
+        # Connect to the host CID (2)
         s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
         s.settimeout(5.0)
-        last_exc: Exception = RuntimeError("no attempts made")
         for _ in range(retries):
             try:
                 s.connect((self._cid, self._port))
-                s.sendall(f"CONNECT {self._port}\n".encode())
-                buf = bytearray()
-                while b"\n" not in buf:
+                # Explicitly add the newline and ensure it is sent
+                msg = f"CONNECT {self._port}\n".encode()
+                s.sendall(msg)
+                
+                # Use a small buffer to read the response
+                response = b""
+                while b"\n" not in response:
                     chunk = s.recv(1)
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                if not bytes(buf).startswith(f"OK {self._port}".encode()):
-                    raise ConnectionRefusedError(
-                        f"unexpected handshake on port {self._port}: {bytes(buf)!r}"
-                    )
-                self._sock = s
-                return
-            except (ConnectionRefusedError, OSError) as exc:
-                last_exc = exc
+                    if not chunk: break
+                    response += chunk
+                
+                if response.startswith(f"OK {self._port}".encode()):
+                    self._sock = s
+                    return
+                raise ConnectionRefusedError(f"Bad Handshake: {response!r}")
+            except (ConnectionRefusedError, OSError):
                 time.sleep(delay)
         raise ConnectionRefusedError(
-            f"host not listening on port {self._port} after {retries} attempts: {last_exc}"
-        )
+            f"host not listening on port {self._port} after {retries} attempts"
+        )   
 
     def send_line(self, data: bytes) -> None:
         if not data.endswith(b"\n"):
