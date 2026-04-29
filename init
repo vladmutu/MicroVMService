@@ -1,18 +1,29 @@
 #!/bin/sh
-# /sbin/init — minimal Firecracker microVM init
+# /run_at_start/init — minimal Firecracker microVM init
 
-export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin
 
 echo "[init] booting..." > /dev/console
 
+echo "[init] mounting filesystems..." > /dev/console
 # --- Mount core filesystems ---
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 
+echo "[init] mounted filesystems:" > /dev/console
+
+echo "[init] checking vsocks..." > /dev/console
+
+ls -l /dev/vsock* > /dev/console 2>&1 || true
+
+echo "[init] vsocks ready, setting up devices..." > /dev/console
+
+echo "[init] setting up devices..." > /dev/console
 # --- Fix critical device nodes ---
 [ -e /dev/null ] || mknod -m 666 /dev/null c 1 3
 chmod 666 /dev/null
+
+echo "[init] devices set up:" > /dev/console
 
 # --- Pseudo terminals ---
 mkdir -p /dev/pts
@@ -22,6 +33,8 @@ mount -t devpts devpts /dev/pts -o mode=620,ptmxmode=666 2>/dev/null || true
 mkdir -p /tmp
 chmod 1777 /tmp
 
+
+echo "[init] initializing network..." > /dev/console
 # --- Network ---
 ip link set lo up
 
@@ -38,6 +51,8 @@ echo "nameserver 8.8.8.8" > /etc/resolv.conf
 # --- Sanity debug (optional, remove later) ---
 echo "[init] network ready:" > /dev/console
 ip addr > /dev/console 2>&1
+
+echo "[init] environment ready, starting agent..." > /dev/console
 
 # --- Run agent ---
 echo "[init] launching agent..." > /dev/console

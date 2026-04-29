@@ -27,7 +27,8 @@ Host ← Guest protocol
 
 Guest ← Host protocol (port 7000)
 ----------------------------------
-  Line 1  : JSON header (newline-terminated)
+  Line 1  : CONNECT 7000\n (handshake from host)
+  Line 2  : JSON header (newline-terminated)
     {
       "job_id":          "<uuid4>",
       "job_type":        "pypi" | "npm",
@@ -117,10 +118,9 @@ _TRACE_SYSCALLS: list[str] = [
     "access", "faccessat",
     "getcwd", "chdir", "fchdir",
     # --- credentials ---
-    # credentials (safe modern subset)
     "getuid", "geteuid", "getgid", "getegid",
     "setresuid", "setresgid",
-    "capget", "capset", "prctl"
+    "capget", "capset", "prctl",
     # --- ipc / misc ---
     "ptrace", "pipe", "pipe2", "dup", "dup2", "dup3", "fcntl", "ioctl",
     "syslog", "sched_setaffinity", "memfd_create",
@@ -149,8 +149,8 @@ _BIN = {
 
 class Channel:
     """
-    Lazy vsock connection with a simple handshake and line-oriented framing.
-    Thread-safe: multiple threads may call send_line() concurrently.
+    Robust vsock channel with safe retry + handshake handling.
+    Thread-safe.
     """
 
     def __init__(self, cid: int, port: int) -> None:
@@ -159,43 +159,64 @@ class Channel:
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
 
-    def connect(self, retries: int = 15, delay: float = 0.5) -> None:
-        # Connect to the host CID (2)
-        s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        for _ in range(retries):
+    def connect(self, retries: int = 20, delay: float = 0.5) -> None:
+        last_error = None
+
+        for attempt in range(retries):
+            s = None
             try:
+                s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+                s.settimeout(3.0)
+
                 s.connect((self._cid, self._port))
-                # Explicitly add the newline and ensure it is sent
-                msg = f"CONNECT {self._port}\n".encode()
-                s.sendall(msg)
-                
-                # Use a small buffer to read the response
+
+                # handshake
+                s.sendall(f"CONNECT {self._port}\n".encode())
+
+                # read response safely (not byte-by-byte)
+                s.settimeout(2.0)
                 response = b""
+                start = time.time()
+
                 while b"\n" not in response:
-                    chunk = s.recv(1)
-                    if not chunk: break
+                    if time.time() - start > 2.0:
+                        raise TimeoutError("handshake timeout")
+
+                    chunk = s.recv(1024)
+                    if not chunk:
+                        raise ConnectionError("empty handshake response")
                     response += chunk
-                
+
                 if response.startswith(f"OK {self._port}".encode()):
+                    s.settimeout(None)
                     self._sock = s
                     return
-                raise ConnectionRefusedError(f"Bad Handshake: {response!r}")
-            except (ConnectionRefusedError, OSError):
+
+                raise ConnectionError(f"bad handshake: {response!r}")
+
+            except Exception as exc:
+                last_error = exc
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
                 time.sleep(delay)
+
         raise ConnectionRefusedError(
-            f"host not listening on port {self._port} after {retries} attempts"
-        )   
+            f"failed to connect to port {self._port} after {retries} attempts: {last_error}"
+        )
 
     def send_line(self, data: bytes) -> None:
         if not data.endswith(b"\n"):
-            data = data + b"\n"
+            data += b"\n"
+
         with self._lock:
-            if self._sock is None:
+            if not self._sock:
                 return
             try:
                 self._sock.sendall(data)
-            except BrokenPipeError:
+            except Exception:
                 pass
 
     def close(self) -> None:
@@ -342,9 +363,14 @@ class StdioRouter:
 # ---------------------------------------------------------------------------
 
 def receive_job() -> tuple[dict[str, Any], str, int]:
+    """
+    Listen on vsock port 7000, handle handshake, receive JSON header + artifact.
+    Returns: (header_dict, actual_sha256, bytes_received)
+    """
     srv = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+    # Bind to vsock port 7000
     for attempt in range(10):
         try:
             srv.bind((socket.VMADDR_CID_ANY, PORT_INGRESS))
@@ -356,20 +382,47 @@ def receive_job() -> tuple[dict[str, Any], str, int]:
         raise RuntimeError("failed to bind vsock port 7000 after 10 retries")
 
     srv.listen(1)
+    print("[agent] listening on vsock port 7000, waiting for connection...", flush=True)
+    
     conn, _ = srv.accept()
+    print("[agent] connection accepted on port 7000", flush=True)
 
+    # ===== HANDSHAKE =====
+    # Expect: "CONNECT 7000\n"
     buf = b""
+    conn.settimeout(5.0)
+    while b"\n" not in buf:
+        chunk = conn.recv(1024)
+        if not chunk:
+            raise ConnectionError("connection closed before handshake")
+        buf += chunk
+
+    handshake_line, buf = buf.split(b"\n", 1)
+    handshake = handshake_line.decode("utf-8", errors="replace").strip()
+    
+    if not handshake.startswith("CONNECT 7000"):
+        raise RuntimeError(f"invalid handshake: {handshake!r}")
+    
+    # Send handshake response
+    conn.sendall(b"OK 7000\n")
+    print(f"[agent] handshake OK: {handshake!r}", flush=True)
+
+    # ===== JSON HEADER =====
+    # Next line is JSON header
+    conn.settimeout(10.0)
     while b"\n" not in buf:
         chunk = conn.recv(4096)
         if not chunk:
-            break
+            raise ConnectionError("connection closed before JSON header")
         buf += chunk
 
-    header_line, leftover = buf.split(b"\n", 1)
-    header: dict[str, Any] = json.loads(header_line.decode())
+    header_line, buf = buf.split(b"\n", 1)
+    header: dict[str, Any] = json.loads(header_line.decode("utf-8"))
+    print(f"[agent] received header: {header}", flush=True)
+
     artifact_size = int(header.get("artifact_size", 0))
 
-    # --- STREAM TO DISK FIX ---
+    # ===== ARTIFACT BYTES (stream to disk) =====
     global ARTIFACT_PATH
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     ARTIFACT_PATH = WORK_DIR / "artifact.pkg"
@@ -377,67 +430,50 @@ def receive_job() -> tuple[dict[str, Any], str, int]:
     hasher = hashlib.sha256()
     bytes_received = 0
 
-    # Open the file in write-binary mode
+    conn.settimeout(30.0)  # Allow time for large artifacts
+
     with ARTIFACT_PATH.open("wb") as f:
-        # 1. Write the initial payload that spilled over from the header split
-        if leftover:
-            initial_data = leftover[:artifact_size]
+        # 1. Write leftover bytes from header split
+        if buf and artifact_size > 0:
+            initial_data = buf[:artifact_size]
             f.write(initial_data)
-            hasher.update(initial_data) # Hash on the fly
+            hasher.update(initial_data)
             bytes_received += len(initial_data)
 
-        # 2. Stream the rest directly from the socket to the disk
+        # 2. Stream remaining bytes
         while bytes_received < artifact_size:
-            chunk = conn.recv(min(65536, artifact_size - bytes_received))
+            remaining = artifact_size - bytes_received
+            chunk = conn.recv(min(65536, remaining))
             if not chunk:
                 break
             f.write(chunk)
-            hasher.update(chunk) # Hash on the fly
+            hasher.update(chunk)
             bytes_received += len(chunk)
 
     actual_sha256 = hasher.hexdigest()
+    print(f"[agent] artifact received: {bytes_received} bytes, sha256={actual_sha256}", flush=True)
 
-    # --- DRAIN AND CLOSE ---
+    # ===== CLEANUP =====
+    # Drain any extra bytes
     conn.settimeout(0.3)
     try:
         while conn.recv(4096):
             pass
     except Exception:
         pass
-    conn.settimeout(None)
-    try:
-        conn.sendall(b"OK 7000\n")
-    except Exception:
-        pass
+
     conn.close()
     srv.close()
     
     return header, actual_sha256, bytes_received
 
+
 # ---------------------------------------------------------------------------
 # Artifact handling
 # ---------------------------------------------------------------------------
 
-def save_and_verify_artifact(data: bytes, expected_sha256: str, job_type: str) -> bool:
-    global ARTIFACT_PATH
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-
-    if data[:4] == b"PK\x03\x04":
-        suffix = ".whl" if job_type == "pypi" else ".zip"
-    elif data[:2] == b"\x1f\x8b":
-        suffix = ".tar.gz" if job_type == "pypi" else ".tgz"
-    else:
-        suffix = ".tar.gz" if job_type == "pypi" else ".tgz"
-
-    ARTIFACT_PATH = WORK_DIR / f"artifact{suffix}"
-    ARTIFACT_PATH.write_bytes(data)
-
-    if expected_sha256:
-        return hashlib.sha256(data).hexdigest() == expected_sha256
-    return True
-
-
 def extract_artifact() -> None:
+    """Extract the artifact to EXTRACT_DIR."""
     EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
     try:
         name = ARTIFACT_PATH.name.lower()
@@ -450,8 +486,8 @@ def extract_artifact() -> None:
         elif tarfile.is_tarfile(str(ARTIFACT_PATH)):
             with tarfile.open(str(ARTIFACT_PATH)) as tf:
                 tf.extractall(str(EXTRACT_DIR))
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[agent] extraction failed: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -482,17 +518,8 @@ def _tail_strace_log(
                 log.raw_strace(line.rstrip("\n"), phase=phase)
 
 
-def _pump_stdout(
-    stream,
-    log: LogStream,
-    phase: str,
-) -> None:
-    """Background thread: drain subprocess stdout and forward to host."""
-    for line in stream:
-        log.stdout_line(line.rstrip("\n"), phase=phase)
-
-
-def _run_strace_once(strace_cmd, log_path):
+def _run_strace_once(strace_cmd):
+    """Run strace command and return process handle."""
     return subprocess.Popen(
         strace_cmd,
         stdout=subprocess.PIPE,
@@ -502,13 +529,22 @@ def _run_strace_once(strace_cmd, log_path):
     )
 
 
-def run_with_strace(cmd: list[str],
+def run_with_strace(
+    cmd: list[str],
     log_path: Path,
     log: LogStream,
     tel: Telemetry,
     phase: str,
     timeout: int,
-):
+) -> tuple[int, bool, bool]:
+    """
+    Run command under strace, streaming output to host.
+    Returns: (exit_code, timed_out, fallback_used)
+    """
+    cmd_text = " ".join(cmd)
+    log.debug(f"strace_launch phase={phase} timeout={timeout}s cmd={cmd_text}")
+    tel.emit("strace_launch", phase=phase, timeout=timeout, cmd=cmd_text)
+
     base_cmd = [
         _BIN["strace"],
         "-f",
@@ -521,8 +557,11 @@ def run_with_strace(cmd: list[str],
         "-o", str(log_path),
     ] + cmd
 
-    proc = _run_strace_once(base_cmd, log_path)
+    proc = _run_strace_once(base_cmd)
+    tel.emit("strace_started", phase=phase, pid=proc.pid, log_path=str(log_path))
     output_buffer = []
+    timed_out = False
+    fallback_used = False
 
     def collect_output():
         if proc.stdout:
@@ -535,8 +574,10 @@ def run_with_strace(cmd: list[str],
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
         log.warning(f"Process timed out after {timeout}s, terminating...")
         tel.emit("process_timeout", phase=phase)
+        tel.emit("strace_timeout", phase=phase, timeout=timeout, fallback=False)
         proc.terminate()
         try:
             proc.wait(timeout=3)
@@ -547,13 +588,17 @@ def run_with_strace(cmd: list[str],
     t.join(timeout=2)
 
     combined_output = "".join(output_buffer)
+    if combined_output.strip():
+        first_line = combined_output.splitlines()[0][:240]
+        log.debug(f"strace_output phase={phase} first_line={first_line}")
 
+    # Check if syscall filter failed
     if "invalid system call" in combined_output:
+        fallback_used = True
         log.warning("strace syscall filter invalid — falling back to trace=all")
-        tel.emit("strace_fallback_triggered", phase=phase)
+        tel.emit("strace_fallback_triggered", phase=phase, reason="invalid_system_call")
 
-        # fallback command (NO syscall filtering)
-        # fallback command (NO syscall filtering)
+        # Fallback: trace all syscalls
         fallback_cmd = [
             _BIN["strace"],
             "-f",
@@ -566,18 +611,37 @@ def run_with_strace(cmd: list[str],
             "-o", str(log_path),
         ] + cmd
 
-        proc = _run_strace_once(fallback_cmd, log_path)
+        tel.emit("strace_fallback_started", phase=phase, reason="invalid_system_call")
+        proc = _run_strace_once(fallback_cmd)
         
-        # --- Add this try/except block ---
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             log.warning(f"Fallback process timed out after {timeout}s, terminating...")
             tel.emit("process_timeout_fallback", phase=phase)
-            proc.kill()
-            proc.wait()
+            tel.emit("strace_timeout", phase=phase, timeout=timeout, fallback=True)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
-    return proc.returncode or 0
+        tel.emit("strace_fallback_done", phase=phase, exit_code=proc.returncode or 0)
+
+    exit_code = proc.returncode or 0
+    tel.emit(
+        "strace_exit",
+        phase=phase,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        fallback=fallback_used,
+    )
+    if exit_code != 0:
+        tel.emit("strace_nonzero_exit", phase=phase, exit_code=exit_code, fallback=fallback_used)
+
+    return exit_code, timed_out, fallback_used
 
 
 # ---------------------------------------------------------------------------
@@ -585,11 +649,13 @@ def run_with_strace(cmd: list[str],
 # ---------------------------------------------------------------------------
 
 def _find_npm_pkg_dir() -> Path:
+    """Find package.json directory in extracted artifact."""
     pkg_jsons = sorted(EXTRACT_DIR.rglob("package.json"), key=lambda p: len(p.parts))
     return pkg_jsons[0].parent if pkg_jsons else EXTRACT_DIR / "package"
 
 
 def build_install_command(job_type: str, package: str, has_artifact: bool) -> list[str]:
+    """Build the install command for pip or npm."""
     if job_type == "pypi":
         if has_artifact:
             target = str(ARTIFACT_PATH)
@@ -607,6 +673,7 @@ def build_install_command(job_type: str, package: str, has_artifact: bool) -> li
 # ---------------------------------------------------------------------------
 
 def find_entry_points(job_type: str, package: str) -> list[list[str]]:
+    """Find entry points to execute after installation."""
     cmds: list[list[str]] = []
 
     if job_type == "pypi":
@@ -655,6 +722,7 @@ def phase_install(
     log: LogStream,
     tel: Telemetry,
 ) -> int:
+    """Phase 2: Install package under strace."""
     log.debug("phase_install_started")
     log.marker("install", "start")
 
@@ -663,12 +731,19 @@ def phase_install(
     log.debug(f"install_cmd={install_cmd}")
 
     install_log = WORK_DIR / "strace_install.log"
-    exit_code = run_with_strace(
+    exit_code, timed_out, fallback_used = run_with_strace(
         install_cmd, install_log, log, tel,
         phase="install", timeout=INSTALL_TIMEOUT,
     )
 
     tel.emit("install_done", exit_code=exit_code)
+    tel.emit("install_outcome", exit_code=exit_code, timed_out=timed_out, fallback=fallback_used)
+    if timed_out:
+        tel.emit("install_timeout", exit_code=exit_code)
+    elif exit_code != 0:
+        tel.emit("install_failed", exit_code=exit_code)
+    else:
+        tel.emit("install_succeeded", exit_code=exit_code)
     log.marker("install", "end")
     log.debug(f"phase_install_done exit_code={exit_code}")
     return exit_code
@@ -680,6 +755,7 @@ def phase_execution_probes(
     log: LogStream,
     tel: Telemetry,
 ) -> int:
+    """Phase 3: Execute entry points under strace."""
     log.debug("phase_exec_probes_started")
     log.marker("exec", "start")
 
@@ -690,11 +766,12 @@ def phase_execution_probes(
     for cmd in probes:
         tel.emit("exec_started", cmd=cmd)
         probe_log = WORK_DIR / f"strace_exec_{safe_name}_{count}.log"
-        exit_code = run_with_strace(
+        exit_code, timed_out, fallback_used = run_with_strace(
             cmd, probe_log, log, tel,
             phase="exec", timeout=PROBE_TIMEOUT,
         )
         tel.emit("exec_done", cmd=cmd, exit_code=exit_code)
+        tel.emit("exec_outcome", exit_code=exit_code, timed_out=timed_out, fallback=fallback_used)
         count += 1
 
     log.marker("exec", "end")
@@ -708,8 +785,8 @@ def phase_ambient_monitor(
     duration: int = MONITOR_DURATION,
 ) -> None:
     """
-    Attach strace to PID 1 for `duration` seconds to catch delayed malicious
-    behaviour (persistence setup, C2 beacons, cron injection, etc.).
+    Phase 4: Attach strace to PID 1 for `duration` seconds to catch delayed
+    malicious behaviour (persistence setup, C2 beacons, cron injection, etc.).
     """
     log.debug(f"phase_monitor_started duration={duration}s")
     tel.emit("monitor_started", duration=duration)
@@ -768,33 +845,59 @@ def phase_ambient_monitor(
 
 def main() -> None:
     print("[agent] started, waiting for job on port 7000", flush=True)
-    # Get the hash and bytes directly from the ingress function
+    
+    # Receive job header and artifact
     header, actual_sha256, bytes_received = receive_job()
-    print(f"[agent] job received: {header.get('job_id')}", flush=True)
-
+    
     job_id: str = header.get("job_id", "unknown")
     job_type: str = header.get("job_type", "pypi")
     package: str = header.get("package", "")
     expected_sha256: str = header.get("artifact_sha256", "")
     artifact_size: int = int(header.get("artifact_size", 0))
 
-    # Open outbound channels
+    print(f"[agent] job received: id={job_id} type={job_type} pkg={package}", flush=True)
+
+    # ===== Open outbound channels =====
     tel_ch = Channel(HOST_CID, PORT_TELEMETRY)
     log_ch = Channel(HOST_CID, PORT_LOGS)
-    print("[agent] connecting outbound channels", flush=True)
+    
+    print("[agent] connecting outbound channels...", flush=True)
+
+    # Connect telemetry (required)
+    tel_ok = False
     for attempt in range(10):
         try:
             tel_ch.connect()
-            log_ch.connect()
+            tel_ok = True
+            print("[agent] telemetry channel connected", flush=True)
             break
         except Exception as exc:
-            print(f"[agent] channel connect attempt {attempt}: {exc}", flush=True)
+            print(f"[agent] telemetry connect attempt {attempt}: {exc}", flush=True)
             time.sleep(1)
+
+    # Connect logs (optional, fallback to telemetry if failed)
+    log_ok = False
+    for attempt in range(10):
+        try:
+            log_ch.connect()
+            log_ok = True
+            print("[agent] logs channel connected", flush=True)
+            break
+        except Exception as exc:
+            print(f"[agent] logs connect attempt {attempt}: {exc}", flush=True)
+            time.sleep(1)
+
+    if not tel_ok:
+        print("[agent] WARNING: telemetry channel failed; continuing without telemetry", flush=True)
+
+    if not log_ok:
+        print("[agent] INFO: logs channel failed; using telemetry for logs", flush=True)
+        log_ch = tel_ch
 
     tel = Telemetry(job_id, tel_ch)
     log = LogStream(log_ch)
 
-    # Route all stdout/stderr through vsock
+    # Route stdout/stderr through vsock
     sys.stdout = StdioRouter(log, "stdout")  # type: ignore[assignment]
     sys.stderr = StdioRouter(log, "stderr")  # type: ignore[assignment]
 
@@ -805,16 +908,12 @@ def main() -> None:
     probe_count = 0
 
     try:
-        # ------------------------------------------------------------------
-        # Phase 1 — Artifact ingress
-        # ------------------------------------------------------------------
+        # ===== Phase 1: Artifact verification =====
         log.debug("phase_artifact_ingress_started")
         
-        # Verify we received exactly what we expected
         has_artifact = artifact_size > 0 and bytes_received == artifact_size
 
         if has_artifact:
-            # Check the hash we computed on-the-fly against the expected hash
             hash_ok = (not expected_sha256) or (actual_sha256 == expected_sha256)
             
             if not hash_ok:
@@ -830,24 +929,16 @@ def main() -> None:
             tel.emit("artifact_received", size=0, note="no_artifact_install_from_registry")
             log.debug("no_artifact_install_from_registry")
 
-        # ------------------------------------------------------------------
-        # Phase 2 — Install under strace
-        # ------------------------------------------------------------------
+        # ===== Phase 2: Install =====
         install_exit_code = phase_install(job_type, package, has_artifact, log, tel)
 
-        # ------------------------------------------------------------------
-        # Phase 3 — Execution probes under strace
-        # ------------------------------------------------------------------
+        # ===== Phase 3: Execution probes =====
         probe_count = phase_execution_probes(job_type, package, log, tel)
 
-        # ------------------------------------------------------------------
-        # Phase 4 — Ambient monitor (strace -p 1)
-        # ------------------------------------------------------------------
+        # ===== Phase 4: Ambient monitoring =====
         phase_ambient_monitor(log, tel)
 
-        # ------------------------------------------------------------------
-        # Completion — emit raw summary line, NO verdict
-        # ------------------------------------------------------------------
+        # ===== Completion =====
         tel.emit("agent_finished",
                  install_exit_code=install_exit_code,
                  probes=probe_count,
@@ -858,7 +949,6 @@ def main() -> None:
         import traceback
         tb = traceback.format_exc()
         log.warning(f"agent_crashed")
-        # Emit traceback line by line so the host can ingest it
         for tb_line in tb.splitlines():
             log.debug(f"traceback| {tb_line}")
         tel.emit("agent_finished", status="crashed")

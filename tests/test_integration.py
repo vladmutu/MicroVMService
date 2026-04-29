@@ -48,7 +48,7 @@ def _make_mock_result(verdict: str = "benign", **kwargs) -> VMRunResult:
             suspicious_syscalls=len(kwargs.get("process_iocs", [])),
             sensitive_writes=len(kwargs.get("file_iocs", [])),
         ),
-        telemetry_events=[{"event": "agent_finished", "job_id": "test"}],
+        telemetry_events=["1700000000.000000 test agent_finished status=ok"],
         log_lines=["[agent] test log line"],
     )
 

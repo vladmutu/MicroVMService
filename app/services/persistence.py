@@ -107,16 +107,18 @@ class PostgresPersistence:
             datetime.now(UTC),
         )
 
-    async def write_telemetry(self, job_id: str, payload: dict[str, Any]) -> None:
+    async def write_telemetry(self, job_id: str, payload: str) -> None:
+        """
+        Store a raw telemetry line (plain text) observed from the guest.
+        """
         if self._pool is None:
             return
         await self._pool.execute(
             """
             INSERT INTO analysis_telemetry_events (job_id, observed_at, payload)
-            VALUES ($1, $2, $3::jsonb)
+            VALUES ($1, $2, $3)
             """,
-            job_id, datetime.now(UTC),
-            json.dumps(payload, separators=(",", ":")),
+            job_id, datetime.now(UTC), payload,
         )
 
     async def write_log(self, job_id: str, source: str, level: str, message: str) -> None:
@@ -215,14 +217,14 @@ class PostgresPersistence:
         )
         return dict(row) if row else None
 
-    async def get_telemetry(self, job_id: str) -> list[dict[str, Any]]:
+    async def get_telemetry(self, job_id: str) -> list[str]:
         if self._pool is None:
             return []
         rows = await self._pool.fetch(
             "SELECT payload FROM analysis_telemetry_events WHERE job_id = $1 ORDER BY observed_at",
             job_id,
         )
-        return [json.loads(row["payload"]) for row in rows]
+        return [row["payload"] for row in rows]
 
     async def get_logs(self, job_id: str) -> list[dict[str, str]]:
         if self._pool is None:
@@ -266,7 +268,7 @@ class PostgresPersistence:
                 id BIGSERIAL PRIMARY KEY,
                 job_id TEXT NOT NULL REFERENCES analysis_jobs(job_id),
                 observed_at TIMESTAMPTZ NOT NULL,
-                payload JSONB NOT NULL
+                payload TEXT NOT NULL
             )
         """)
         await self._pool.execute("""

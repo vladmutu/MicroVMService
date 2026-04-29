@@ -76,7 +76,7 @@ class VMWorkspace:
 class VMRunResult:
     """Outcome of a single VM analysis run."""
     evidence: IOCEvidence
-    telemetry_events: list[dict[str, Any]] = field(default_factory=list)
+    telemetry_events: list[str] = field(default_factory=list)
     relevant_runtime_events: list[dict[str, Any]] = field(default_factory=list)
     relevant_runtime_summary: dict[str, Any] = field(default_factory=dict)
     log_lines: list[str] = field(default_factory=list)
@@ -230,7 +230,7 @@ class VMLifecycleManager:
         pipe_tasks: list[asyncio.Task[None]] = []
 
         detector = DynamicIOCDetector()
-        telemetry_events: list[dict[str, Any]] = []
+        telemetry_events: list[str] = []
         relevant_runtime_events: list[dict[str, Any]] = []
         relevant_runtime_summary: dict[str, Any] = {
             "event_count": 0,
@@ -442,7 +442,7 @@ class VMLifecycleManager:
         self,
         workspace: VMWorkspace,
         detector: DynamicIOCDetector,
-        telemetry_events: list[dict[str, Any]],
+        telemetry_events: list[str],
         relevant_runtime_events: list[dict[str, Any]],
         relevant_runtime_summary: dict[str, Any],
         log_lines: list[str],
@@ -458,7 +458,7 @@ class VMLifecycleManager:
         ) -> None:
             try:
                 # Vsock handshake: guest sends "CONNECT {port}\n", host replies "OK {port}\n"
-                handshake = await asyncio.wait_for(reader.readline(), timeout=10.0)
+                handshake = await asyncio.wait_for(reader.readline(), timeout=30.0)
                 expected = f"CONNECT {port}".encode()
                 if not handshake.startswith(expected):
                     logger.warning("[%s] Bad handshake on port %d: %r", job_id, port, handshake)
@@ -483,7 +483,7 @@ class VMLifecycleManager:
                     await writer.wait_closed()
 
         async def on_telemetry_line(text: str) -> None:
-            telemetry_events.append({"raw": text})
+            telemetry_events.append(text)
             logger.debug("[%s][telemetry] %s", job_id, text[:200])
             if " agent_finished " in text or " verdict " in text or text.endswith(" agent_finished") or text.endswith(" verdict"):
                 # Give a short delay to allow log_lines from vsock port 7002 to flush
@@ -535,31 +535,60 @@ class VMLifecycleManager:
 
             logger.debug("[%s][log] %s", job_id, text[:200])
 
-        # Remove stale sockets
-        for sock_path in (workspace.telemetry_socket, workspace.log_socket):
-            with suppress(FileNotFoundError):
-                sock_path.unlink()
+        # Ensure old vsock UDS is removed
+        with suppress(FileNotFoundError):
+            workspace.telemetry_socket.unlink()
+        with suppress(FileNotFoundError):
+            workspace.log_socket.unlink()
+
+        # Connector task: actively connect to the Firecracker vsock UDS and
+        # request a pairing for the given port (7001/7002). When paired,
+        # stream lines into the on_line handler.
+        async def _connector(port: int, on_line: Any) -> None:
+            path = str(workspace.vsock_socket)
+            backoff = 0.1
+            while True:
+                try:
+                    reader, writer = await asyncio.open_unix_connection(path)
+                    # Send CONNECT handshake as the host side
+                    writer.write(f"CONNECT {port}\n".encode())
+                    await writer.drain()
+                    # Read ack
+                    ack = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                    if not ack.startswith(f"OK {port}".encode()):
+                        writer.close()
+                        with suppress(Exception):
+                            await writer.wait_closed()
+                        await asyncio.sleep(backoff)
+                        backoff = min(2.0, backoff * 2)
+                        continue
+
+                    # Paired — reset backoff and consume lines
+                    backoff = 0.1
+                    while True:
+                        line = await reader.readline()
+                        if not line:
+                            break
+                        text = line.decode("utf-8", errors="replace").rstrip("\n")
+                        if text:
+                            await on_line(text)
+                    writer.close()
+                    with suppress(Exception):
+                        await writer.wait_closed()
+                except Exception:
+                    await asyncio.sleep(backoff)
+                    backoff = min(2.0, backoff * 2)
 
         tel_port = self._settings.vsock_telemetry_port
         log_port = self._settings.vsock_log_port
 
-        telemetry_server = await asyncio.start_unix_server(
-            lambda r, w: _handle_channel(r, w, tel_port, on_telemetry_line),
-            path=str(workspace.telemetry_socket),
-            limit=5 * 1024 * 1024,  # 5MB limit for large strace lines
-        )
-        log_server = await asyncio.start_unix_server(
-            lambda r, w: _handle_channel(r, w, log_port, on_log_line),
-            path=str(workspace.log_socket),
-            limit=5 * 1024 * 1024,  # 5MB limit for large strace lines
-        )
-
         tasks = [
-            asyncio.create_task(telemetry_server.serve_forever()),
-            asyncio.create_task(log_server.serve_forever()),
+            asyncio.create_task(_connector(tel_port, on_telemetry_line)),
+            asyncio.create_task(_connector(log_port, on_log_line)),
         ]
 
-        return telemetry_server, log_server, tasks
+        # We don't create separate unix servers for telemetry/logs — return None
+        return None, None, tasks
 
     # ─── Job delivery (vsock port 7000) ───────────────────────────────
 
@@ -614,13 +643,16 @@ class VMLifecycleManager:
             if not proxy_ack.startswith(b"OK"):
                 raise RuntimeError(f"Vsock proxy rejected CONNECT 7000: {proxy_ack!r}")
 
+            # The forwarded guest stream still expects its own CONNECT line.
+            sock.sendall(b"CONNECT 7000\n")
+            guest_ack = self._recv_line(sock)
+            if not guest_ack.startswith(b"OK"):
+                raise RuntimeError(f"Guest agent rejected CONNECT 7000: {guest_ack!r}")
+
             # Send framed payload: JSON header + artifact bytes
             sock.sendall(json.dumps(payload, separators=(",", ":")).encode() + b"\n")
             if artifact_bytes:
                 sock.sendall(artifact_bytes)
-
-            with suppress(OSError):
-                sock.shutdown(socket.SHUT_WR)
 
             # Wait for agent ack
             agent_ack = self._recv_line(sock)

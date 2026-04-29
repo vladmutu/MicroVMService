@@ -32,11 +32,12 @@ class Settings(BaseSettings):
     firecracker_default_rootfs: str = "/opt/firecracker/rootfs.ext4"
     firecracker_boot_args: str = (
         "console=ttyS0 reboot=k panic=1 pci=off "
-        "root=/dev/vda rw rootwait init=/sbin/init"
+        "root=/dev/vda rw rootwait init=/run_at_start/init"
     )
 
     # ── VM resources ──────────────────────────────────────────────────
-    firecracker_vcpu_count: int = Field(default=2, gt=0, le=4)
+    # Default to 1 vCPU to avoid guest kernel SMP/timer instability
+    firecracker_vcpu_count: int = Field(default=1, gt=0, le=4)
     firecracker_mem_mib: int = Field(default=1024, gt=128, le=4096)
 
     # ── CID allocation (must be unique per concurrent VM, ≥ 3) ───────

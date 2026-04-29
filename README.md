@@ -88,7 +88,7 @@ app/
         ├── generic.py               # Deterministic fallback
         └── vm_lifecycle.py          # CID alloc, TAP, FC lifecycle
 real_agent.py                        # Guest agent (copy into rootfs)
-init                                 # Guest /sbin/init script
+init                                 # Guest /run_at_start/init script
 ```
 
 ## IOC Detection
