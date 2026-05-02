@@ -59,45 +59,91 @@ def _write_console(text: str) -> None:
 # NETWORK MANAGEMENT (NEW)
 # ============================================================================
 
-def setup_tap_network(tap_name: str, host_ip: str = "172.16.0.1/30") -> str:
-    """Creates a TAP device and configures NAT for outbound internet."""
-    print(f"[smoke] setting up host network interface {tap_name}...")
-    
-    # 1. Find the default outbound network interface (e.g., eth0, wlan0)
-    out_iface = "eth0"
-    try:
-        ip_route = subprocess.run(["ip", "route"], capture_output=True, text=True, check=True).stdout
-        for line in ip_route.splitlines():
-            if line.startswith("default"):
-                parts = line.split()
-                if "dev" in parts:
-                    out_iface = parts[parts.index("dev") + 1]
-                    break
-    except Exception as e:
-        print(f"[smoke] WARNING: Could not detect default route, assuming {out_iface}: {e}")
+def _iptables() -> str:
+    """Use iptables-legacy when available (WSL2 often defaults to iptables-nft)."""
+    if shutil.which("iptables-legacy"):
+        return "iptables-legacy"
+    return "iptables"
 
-    # 2. Create and configure the TAP device
-    subprocess.run(["sudo", "ip", "tuntap", "add", "dev", tap_name, "mode", "tap"], check=False, capture_output=True)
-    subprocess.run(["sudo", "ip", "addr", "add", host_ip, "dev", tap_name], check=False, capture_output=True)
-    subprocess.run(["sudo", "ip", "link", "set", "dev", tap_name, "up"], check=False, capture_output=True)
 
-    # 3. Enable IP forwarding and configure NAT so the VM can reach the internet
-    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"], check=False, capture_output=True)
-    subprocess.run(["sudo", "iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", "172.16.0.0/30", "-o", out_iface, "-j", "MASQUERADE"], check=False, capture_output=True)
-    subprocess.run(["sudo", "iptables", "-I", "FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"], check=False, capture_output=True)
-    subprocess.run(["sudo", "iptables", "-I", "FORWARD", "-i", tap_name, "-o", out_iface, "-j", "ACCEPT"], check=False, capture_output=True)
-    
-    print(f"[smoke] network ready (NAT via {out_iface})")
-    return out_iface
+def get_default_iface() -> str:
+    out = subprocess.run(["ip", "route"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if line.startswith("default") and "dev" in line:
+            return line.split()[line.split().index("dev") + 1]
+    return "eth0"
 
-def teardown_tap_network(tap_name: str, out_iface: str) -> None:
+
+def setup_tap_network(tap_name: str, vm_id: int = 0) -> tuple[str, str, str]:
+    """Create a direct TAP + NAT setup for the smoke test (matches production vm_lifecycle.py)."""
+    out_iface = get_default_iface()
+    ipt = _iptables()
+    base = f"172.16.{vm_id}"
+    host_ip = f"{base}.1/24"
+    guest_ip = f"{base}.2"
+    subnet = f"{base}.0/24"
+
+    print(f"[smoke] using {ipt}, outbound interface: {out_iface}, subnet: {subnet}")
+
+    # Tear down any stale state from a previous run before re-creating
+    teardown_tap_network(tap_name)
+
+    user = os.environ.get("SUDO_USER", os.getenv("USER", "root"))
+    cmds = [
+        ["sudo", "ip", "tuntap", "add", "dev", tap_name, "mode", "tap",
+         "user", user],
+        ["sudo", "ip", "addr", "add", host_ip, "dev", tap_name],
+        ["sudo", "ip", "link", "set", tap_name, "up"],
+        ["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"],
+        # NAT so VM can reach internet
+        ["sudo", ipt, "-t", "nat", "-A", "POSTROUTING",
+         "-o", out_iface, "-j", "MASQUERADE"],
+        # Forward rules for TAP ↔ WAN
+        ["sudo", ipt, "-A", "FORWARD", "-m", "conntrack",
+         "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        ["sudo", ipt, "-A", "FORWARD",
+         "-i", tap_name, "-o", out_iface, "-j", "ACCEPT"],
+        # Block VM from scanning private networks
+        ["sudo", ipt, "-I", "FORWARD", "-i", tap_name,
+         "-d", "192.168.0.0/16", "-j", "DROP"],
+        ["sudo", ipt, "-I", "FORWARD", "-i", tap_name,
+         "-d", "10.0.0.0/8", "-j", "DROP"],
+        ["sudo", ipt, "-I", "FORWARD", "-i", tap_name,
+         "-d", "172.16.0.0/12", "-j", "DROP"],
+        # But allow the host-guest link itself (TAP subnet)
+        ["sudo", ipt, "-I", "FORWARD", "-i", tap_name,
+         "-d", subnet, "-j", "ACCEPT"],
+    ]
+    for cmd in cmds:
+        subprocess.run(cmd, stderr=subprocess.DEVNULL)
+
+    print(f"[smoke] network ready (tap={tap_name}, NAT via {out_iface}, private nets blocked)")
+    return guest_ip, f"{base}.1", out_iface
+
+
+def teardown_tap_network(tap_name: str) -> None:
     """Cleans up the TAP device and NAT rules."""
-    print(f"[smoke] tearing down host network interface {tap_name}...")
-    subprocess.run(["sudo", "iptables", "-t", "nat", "-D", "POSTROUTING", "-o", out_iface, "-j", "MASQUERADE"], check=False, capture_output=True)
-    subprocess.run(["sudo", "iptables", "-D", "FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"], check=False, capture_output=True)
-    subprocess.run(["sudo", "iptables", "-D", "FORWARD", "-i", tap_name, "-o", out_iface, "-j", "ACCEPT"], check=False, capture_output=True)
-    subprocess.run(["sudo", "ip", "link", "set", "dev", tap_name, "down"], check=False, capture_output=True)
-    subprocess.run(["sudo", "ip", "tuntap", "del", "dev", tap_name, "mode", "tap"], check=False, capture_output=True)
+    ipt = _iptables()
+    out_iface = get_default_iface()
+    for cmd in [
+        ["sudo", ipt, "-D", "FORWARD", "-i", tap_name,
+         "-d", "172.16.0.0/24", "-j", "ACCEPT"],
+        ["sudo", ipt, "-D", "FORWARD", "-i", tap_name,
+         "-d", "172.16.0.0/12", "-j", "DROP"],
+        ["sudo", ipt, "-D", "FORWARD", "-i", tap_name,
+         "-d", "10.0.0.0/8", "-j", "DROP"],
+        ["sudo", ipt, "-D", "FORWARD", "-i", tap_name,
+         "-d", "192.168.0.0/16", "-j", "DROP"],
+        ["sudo", ipt, "-D", "FORWARD",
+         "-i", tap_name, "-o", out_iface, "-j", "ACCEPT"],
+        ["sudo", ipt, "-D", "FORWARD", "-m", "conntrack",
+         "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        ["sudo", ipt, "-t", "nat", "-D", "POSTROUTING",
+         "-o", out_iface, "-j", "MASQUERADE"],
+        ["sudo", "ip", "link", "set", "dev", tap_name, "down"],
+        ["sudo", "ip", "tuntap", "del", "dev", tap_name, "mode", "tap"],
+    ]:
+        subprocess.run(cmd, check=False, capture_output=True)
 
 # ============================================================================
 # CORE COMPONENTS
@@ -311,10 +357,14 @@ def connect_and_send(
 
     while time.monotonic() < deadline:
         try:
+            # Connect to the Unix Domain Socket that Firecracker maps to the guest vsock
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(5.0)
                 sock.connect(str(vsock_path))
 
+                # --- STEP 1: Handshake ---
+                # We send this once. Firecracker's proxy uses this to route to the guest port.
+                # The Guest Agent's receive_job() also reads this to verify the connection.
                 sock.sendall(b"CONNECT 7000\n")
                 
                 ack = b""
@@ -328,23 +378,12 @@ def connect_and_send(
                 if not ack.startswith(b"OK"):
                     raise RuntimeError(f"vsock ack rejected: {ack!r}")
 
-                print(f"[smoke] handshake OK: {ack.decode('utf-8', errors='replace').strip()}")
+                # Clean up the ack string for logging
+                decoded_ack = ack.decode('utf-8', errors='replace').strip()
+                print(f"[smoke] Handshake successful: {decoded_ack}")
 
-                sock.sendall(b"CONNECT 7000\n")
-
-                guest_ack = b""
-                start = time.monotonic()
-                while b"\n" not in guest_ack and (time.monotonic() - start) < 5.0:
-                    chunk = sock.recv(1024)
-                    if not chunk:
-                        raise ConnectionError("connection closed during guest handshake")
-                    guest_ack += chunk
-
-                if not guest_ack.startswith(b"OK"):
-                    raise RuntimeError(f"guest handshake rejected: {guest_ack!r}")
-
-                print(f"[smoke] guest handshake OK: {guest_ack.decode('utf-8', errors='replace').strip()}")
-
+                # --- STEP 2: Send JSON Header ---
+                # Do NOT send "CONNECT 7000" again. The guest is now waiting for JSON.
                 header = {
                     "job_id": job_id,
                     "job_type": job_type,
@@ -358,23 +397,26 @@ def connect_and_send(
                 sock.sendall(payload + b"\n")
                 print(f"[smoke] sent header: {header}")
 
+                # --- STEP 3: Send Artifact Bytes ---
                 if artifact_bytes:
                     sock.sendall(artifact_bytes)
                     print(f"[smoke] sent {len(artifact_bytes)} bytes of artifact")
 
+                # Signal to the guest that we are done writing
                 try:
                     sock.shutdown(socket.SHUT_WR)
                 except OSError:
                     pass
 
-                return ack.decode("utf-8", errors="replace").strip()
+                return decoded_ack
 
         except Exception as exc:
             last_err = str(exc)
             print(f"[smoke] connection attempt failed: {exc}")
-            time.sleep(0.25)
+            # Small sleep to prevent tight-looping while the VM is still booting
+            time.sleep(0.5)
 
-    raise RuntimeError(f"failed to deliver payload to port 7000: {last_err}")
+    raise RuntimeError(f"failed to deliver payload to port 7000 within {timeout}s: {last_err}")
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Standalone Firecracker vsock smoke test")
@@ -394,7 +436,7 @@ def main() -> int:
     parser.add_argument("--package", default="requests")
     parser.add_argument("--artifact-file", default="", help="Use existing file instead of downloading")
     parser.add_argument("--boot-timeout", type=float, default=30.0)
-    parser.add_argument("--stream-timeout", type=float, default=120.0) # Increased timeout for downloads
+    parser.add_argument("--stream-timeout", type=float, default=300.0)  # 90s install + 60s*2 probes + 45s monitor + slack
     parser.add_argument("--skip-download", action="store_true", help="Use dummy artifact")
     args = parser.parse_args()
 
@@ -456,12 +498,13 @@ def main() -> int:
     logs_listener = Listener(logs_sock, expect_json=False)
 
     proc: subprocess.Popen[bytes] | None = None
-    out_iface = None
 
     try:
         # ===== NETWORK SETUP =====
-        out_iface = setup_tap_network(args.tap_name)
-        phases["host_network"] = PhaseResult(True, f"TAP device {args.tap_name} created and NAT active")
+        guest_ip, gateway_ip, out_iface = setup_tap_network(args.tap_name)
+        phases["host_network"] = PhaseResult(True, f"TAP device {args.tap_name} created and NAT active via {out_iface}")
+
+        boot_args = f"{args.boot_args} fc_ip={guest_ip} fc_gw={gateway_ip} fc_mask=24"
 
         telemetry_listener.start()
         logs_listener.start()
@@ -480,7 +523,7 @@ def main() -> int:
             firecracker_put(
                 client,
                 "/boot-source",
-                {"kernel_image_path": str(kernel), "boot_args": args.boot_args},
+                {"kernel_image_path": str(kernel), "boot_args": boot_args},
             )
             firecracker_put(
                 client,
@@ -572,8 +615,7 @@ def main() -> int:
             if stderr_b: _write_console(stderr_b.decode("utf-8", errors="replace").strip())
 
         # Clean up the network interface
-        if out_iface is not None:
-            teardown_tap_network(args.tap_name, out_iface)
+        teardown_tap_network(args.tap_name)
 
         # =========================================================
         # ===== NEW SECTION: PRINT ALL CAPTURED LOGS FULLY ========

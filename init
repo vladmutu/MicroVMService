@@ -1,101 +1,87 @@
 #!/bin/sh
-# /run_at_start/init — robust Firecracker microVM init
+# /run_at_start/init — Production MicroVM Init
+# Agent is enabled; all output is streamed to /dev/console
 
 echo "[init] booting..." > /dev/console
 
-echo "[init] mounting filesystems..." > /dev/console
 # --- Mount core filesystems ---
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t proc proc /proc        > /dev/console 2>&1
+mount -t sysfs sysfs /sys       > /dev/console 2>&1
+mount -t devtmpfs devtmpfs /dev > /dev/console 2>&1 || true
 
-echo "[init] mounted filesystems:" > /dev/console
-
-echo "[init] checking vsocks..." > /dev/console
-ls -l /dev/vsock* > /dev/console 2>&1 || true
-
-echo "[init] vsocks ready, setting up devices..." > /dev/console
+mkdir -p /root /tmp
+chmod 1777 /tmp
 
 # --- Fix critical device nodes ---
 [ -e /dev/null ] || mknod -m 666 /dev/null c 1 3
 chmod 666 /dev/null
-
-# --- Pseudo terminals ---
 mkdir -p /dev/pts
-mount -t devpts devpts /dev/pts -o mode=620,ptmxmode=666 2>/dev/null || true
+mount -t devpts devpts /dev/pts -o mode=620,ptmxmode=666 > /dev/console 2>&1 || true
 
-# --- tmp (agent workspace) ---
-mkdir -p /tmp
-chmod 1777 /tmp
+# --- FIX 1: Disable IPv6 entirely to prevent routing blackholes ---
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 > /dev/console 2>&1
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 > /dev/console 2>&1
 
-echo "[init] initializing network..." > /dev/console
-# --- Network ---
-ip link set lo up
+# --- Network setup ---
+echo "[init] bringing up loopback..." > /dev/console
+ip link set lo up > /dev/console 2>&1
 
-# THE FIX: Wait up to 2 seconds for the kernel to finish probing the eth0 device
-echo "[init] waiting for kernel to probe eth0..." > /dev/console
+echo "[init] waiting for eth0..." > /dev/console
 count=0
 while [ $count -lt 20 ]; do
-    if ip link show eth0 >/dev/null 2>&1; then
-        echo "[init] eth0 found!" > /dev/console
+    if ip link show eth0 > /dev/null 2>&1; then
+        echo "[init] eth0 found" > /dev/console
         break
     fi
     sleep 0.1
     count=$((count+1))
 done
 
-# Now configure it safely
-if ip link show eth0 >/dev/null 2>&1; then
-    echo "[init] configuring eth0..." > /dev/console
-    ip link set eth0 mtu 1420 up
-    ip addr add 172.16.0.2/30 dev eth0
-    ip route add default via 172.16.0.1
+if ip link show eth0 > /dev/null 2>&1; then
+    # Read per-VM IP config injected by host via kernel boot args
+    for p in $(cat /proc/cmdline); do
+        case "$p" in
+            fc_ip=*)   FC_IP="${p#fc_ip=}" ;;
+            fc_gw=*)   FC_GW="${p#fc_gw=}" ;;
+            fc_mask=*) FC_MASK="${p#fc_mask=}" ;;
+        esac
+    done
+    FC_IP="${FC_IP:-172.16.0.2}"
+    FC_GW="${FC_GW:-172.16.0.1}"
+    FC_MASK="${FC_MASK:-24}"
+
+    # Standard MTU (The host iptables MSS clamp handles the WSL2 overhead)
+    echo "[init] configuring eth0 (ip=${FC_IP}/${FC_MASK} gw=${FC_GW})..." > /dev/console
+    ip link set eth0 up                  > /dev/console 2>&1
+    ip addr add "${FC_IP}/${FC_MASK}" dev eth0 > /dev/console 2>&1
+    ip route add default via "$FC_GW"    > /dev/console 2>&1
 else
-    echo "[init] ERROR: eth0 never appeared!" > /dev/console
-    # Dump kernel logs to see why the network driver failed
-    dmesg | tail -n 20 > /dev/console
+    echo "[init] ERROR: eth0 never appeared" > /dev/console
 fi
 
 # --- DNS ---
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
+echo "[init] /etc/resolv.conf written" > /dev/console
 
-# ==========================================
-# NEW: Wait for the routing table to settle!
-# ==========================================
-echo "[init] verifying internet connectivity..." > /dev/console
-inet_count=0
-while [ $inet_count -lt 50 ]; do
-    # Try to ping Google's DNS. If it succeeds, break the loop.
-    if ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1; then
-        echo "[init] internet is reachable!" > /dev/console
-        break
-    fi
-    sleep 0.1
-    inet_count=$((inet_count+1))
-done
-
-# --- Sanity debug ---
-echo "[init] network ready:" > /dev/console
-ip addr > /dev/console 2>&1
-ip route > /dev/console 2>&1
-
-echo "[init] environment ready, configuring agent environment..." > /dev/console
-
-# --- Set Environment Variables ---
-# Give the agent and strace a standard Linux environment
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
-export USER=root
 
-# --- Run agent ---
-echo "[init] launching agent..." > /dev/console
+# --- FIX 2: Start Entropy Daemon (Crucial for HTTPS/pip/npm) ---
+echo "[init] Starting haveged..." > /dev/console
+if command -v haveged >/dev/null 2>&1; then
+    haveged -w 1024
+    echo "[init] haveged is running in the background." > /dev/console
+else
+    echo "[init] WARNING: haveged not found! TLS connections may hang." > /dev/console
+fi
 
-python3 -u /opt/agent.py > /dev/console 2>&1
+# --- Agent Startup ---
+echo "[init] Starting Agent..." > /dev/console
+/usr/bin/python3 -u /opt/agent.py > /dev/console 2>&1
 AGENT_EXIT=$?
+echo "[init] agent exited with code $AGENT_EXIT" > /dev/console
 
-echo "[init] agent exited ($AGENT_EXIT)" > /dev/console
-
-# --- Graceful shutdown ---
+# --- Shutdown ---
 sync
-sleep 1
+sleep 2
 poweroff -f

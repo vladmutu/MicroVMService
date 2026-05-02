@@ -560,7 +560,7 @@ def run_with_strace(
     timeout: int,
 ) -> tuple[int, bool, bool]:
     """
-    Run command under strace, streaming output to host.
+    Run command under strace, streaming strace output to host in real-time.
     Returns: (exit_code, timed_out, fallback_used)
     """
     cmd_text = " ".join(cmd)
@@ -593,6 +593,14 @@ def run_with_strace(
     t = threading.Thread(target=collect_output, daemon=True)
     t.start()
 
+    # Stream strace log to host in real-time while command runs
+    tailer = threading.Thread(
+        target=_tail_strace_log,
+        args=(log_path, proc, log, phase),
+        daemon=True,
+    )
+    tailer.start()
+
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -608,11 +616,14 @@ def run_with_strace(
             proc.wait()
 
     t.join(timeout=2)
+    tailer.join(timeout=3.0)
 
     combined_output = "".join(output_buffer)
     if combined_output.strip():
-        first_line = combined_output.splitlines()[0][:240]
-        log.debug(f"strace_output phase={phase} first_line={first_line}")
+        log.debug("--- COMMAND OUTPUT ---")
+        for line in combined_output.splitlines():
+            log.debug(f"CMD_OUTPUT: {line}")
+        log.debug("----------------------")
 
     # Check if syscall filter failed
     if "invalid system call" in combined_output:
@@ -620,7 +631,6 @@ def run_with_strace(
         log.warning("strace syscall filter invalid — falling back to trace=all")
         tel.emit("strace_fallback_triggered", phase=phase, reason="invalid_system_call")
 
-        # Fallback: trace all syscalls
         fallback_cmd = [
             _BIN["strace"],
             "-f",
@@ -635,7 +645,22 @@ def run_with_strace(
 
         tel.emit("strace_fallback_started", phase=phase, reason="invalid_system_call")
         proc = _run_strace_once(fallback_cmd)
-        
+
+        def _drain_fallback():
+            if proc.stdout:
+                for _ in proc.stdout:
+                    pass
+
+        tf = threading.Thread(target=_drain_fallback, daemon=True)
+        tf.start()
+
+        fallback_tailer = threading.Thread(
+            target=_tail_strace_log,
+            args=(log_path, proc, log, phase),
+            daemon=True,
+        )
+        fallback_tailer.start()
+
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -650,6 +675,8 @@ def run_with_strace(
                 proc.kill()
                 proc.wait()
 
+        tf.join(timeout=2)
+        fallback_tailer.join(timeout=3.0)
         tel.emit("strace_fallback_done", phase=phase, exit_code=proc.returncode or 0)
 
     exit_code = proc.returncode or 0
@@ -660,19 +687,6 @@ def run_with_strace(
         timed_out=timed_out,
         fallback=fallback_used,
     )
-    combined_output = "".join(output_buffer)
-    if combined_output.strip():
-        first_line = combined_output.splitlines()[0][:240]
-        log.debug(f"strace_output phase={phase} first_line={first_line}")
-        
-        # ==========================================
-        # UPDATED: Just print everything unconditionally!
-        # ==========================================
-        log.debug("--- COMMAND OUTPUT ---")
-        for line in combined_output.splitlines():
-            log.debug(f"PIP_OUTPUT: {line}")
-        log.debug("----------------------")
-        # ==========================================
     if exit_code != 0:
         tel.emit("strace_nonzero_exit", phase=phase, exit_code=exit_code, fallback=fallback_used)
 
@@ -787,16 +801,6 @@ def phase_install(
         phase="install", timeout=INSTALL_TIMEOUT,
     )
 
-    # ==========================================
-    # NEW: ACTUALLY SEND THE LOGS TO THE HOST!
-    # ==========================================
-    if install_log.exists():
-        log.debug(f"Streaming install strace logs to host...")
-        with install_log.open("r", errors="replace") as f:
-            for line in f:
-                log.raw_strace(line, phase="install")
-    # ==========================================
-
     tel.emit("install_done", exit_code=exit_code)
     tel.emit("install_outcome", exit_code=exit_code, timed_out=timed_out, fallback=fallback_used)
     if timed_out:
@@ -831,16 +835,6 @@ def phase_execution_probes(
             cmd, probe_log, log, tel,
             phase="exec", timeout=PROBE_TIMEOUT,
         )
-        
-        # ==========================================
-        # NEW: SEND THE EXECUTION LOGS TO THE HOST!
-        # ==========================================
-        if probe_log.exists():
-            with probe_log.open("r", errors="replace") as f:
-                for line in f:
-                    log.raw_strace(line, phase=f"exec_{count}")
-        # ==========================================
-
         tel.emit("exec_done", cmd=cmd, exit_code=exit_code)
         tel.emit("exec_outcome", exit_code=exit_code, timed_out=timed_out, fallback=fallback_used)
         count += 1
