@@ -105,7 +105,7 @@ _TRACE_SYSCALLS: list[str] = [
     "getsockopt", "setsockopt", "shutdown",
     # --- filesystem ---
     "open", "openat", "creat",
-    "read", "write", "pread64", "pwrite64", "readv", "writev",
+    # REMOVED: "read", "write", "pread64", "pwrite64", "readv", "writev",
     "mmap", "munmap", "mprotect",
     "unlink", "unlinkat",
     "rename", "renameat", "renameat2",
@@ -500,10 +500,11 @@ def detect_and_normalize_artifact(path: Path) -> Path | None:
         elif tarfile.is_tarfile(path):
             new_ext = ".tar"
 
+        # FIXED: This is now unindented to run for all file types
         if new_ext:
-            new_path = path.with_suffix(new_ext)
-            path.replace(new_path)
-            return new_path
+            new_name = path.with_name(path.stem + new_ext)
+            path.replace(new_name)
+            return new_name
 
         return None
 
@@ -659,6 +660,19 @@ def run_with_strace(
         timed_out=timed_out,
         fallback=fallback_used,
     )
+    combined_output = "".join(output_buffer)
+    if combined_output.strip():
+        first_line = combined_output.splitlines()[0][:240]
+        log.debug(f"strace_output phase={phase} first_line={first_line}")
+        
+        # ==========================================
+        # UPDATED: Just print everything unconditionally!
+        # ==========================================
+        log.debug("--- COMMAND OUTPUT ---")
+        for line in combined_output.splitlines():
+            log.debug(f"PIP_OUTPUT: {line}")
+        log.debug("----------------------")
+        # ==========================================
     if exit_code != 0:
         tel.emit("strace_nonzero_exit", phase=phase, exit_code=exit_code, fallback=fallback_used)
 
@@ -686,11 +700,11 @@ def build_install_command(job_type: str, package: str, has_artifact: bool) -> li
         if has_artifact:
             target = str(ARTIFACT_PATH)
             if ARTIFACT_PATH.suffix == ".whl":
-                return [_BIN["pip"], "install", "--no-cache-dir", "--no-index", target]
-            return [_BIN["pip"], "install", "--no-cache-dir", "--no-deps", target]
-        return [_BIN["pip"], "install", "--no-cache-dir", "--no-deps", package]
+                # Removed --no-index so it fetches dependencies!
+                return [_BIN["pip"], "install", "--no-cache-dir", target]
+            return [_BIN["pip"], "install", "--no-cache-dir", target]
+        return [_BIN["pip"], "install", "--no-cache-dir", package]
 
-    # For npm, prefer installing directly from the artifact file when present.
     target = str(ARTIFACT_PATH) if has_artifact else package
     return [_BIN["npm"], "install", "--no-fund", "--no-audit", target]
 
@@ -734,42 +748,54 @@ def phase_install(
     tel: Telemetry,
 ) -> int:
     """Phase 2: Install package under strace."""
+    global ARTIFACT_PATH
     log.debug("phase_install_started")
     log.marker("install", "start")
 
+    if has_artifact:
+        # Artifact is already renamed using host metadata in main()
+        log.debug(f"artifact path is {ARTIFACT_PATH}")
+
+    # 1. Create a per-job virtual environment FIRST (if PyPI)
+    venv_dir = WORK_DIR / "venv"
+    if job_type == "pypi":
+        try:
+            WORK_DIR.mkdir(parents=True, exist_ok=True)
+            # Create venv using system python
+            subprocess.run([_BIN["python"], "-m", "venv", str(venv_dir)], check=True, timeout=20)
+            tel.emit("venv_created", path=str(venv_dir))
+            log.debug(f"venv created at {venv_dir}")
+            
+            # THE FIX: Override global binaries to point directly into the venv!
+            # This ensures both the install AND the exec probes use the venv automatically.
+            _BIN["python"] = str(venv_dir / "bin" / "python3")
+            _BIN["pip"] = str(venv_dir / "bin" / "pip3")
+            
+        except Exception as exc:
+            tel.emit("venv_creation_failed", error=str(exc).replace(" ", "%20"))
+            log.warning(f"venv creation failed: {exc}")
+
+    # 2. NOW build the install command (it will use the updated _BIN["pip"])
     install_cmd = build_install_command(job_type, package, has_artifact)
     log.debug(f"install_cmd={install_cmd}")
+    tel.emit("install_started", cmd=install_cmd)
 
-    # Create a per-job virtual environment under WORK_DIR/venv
-    venv_dir = WORK_DIR / "venv"
-    venv_created = False
-    try:
-        # Ensure parent exists
-        WORK_DIR.mkdir(parents=True, exist_ok=True)
-        # Create venv using system python
-        subprocess.run([_BIN["python"], "-m", "venv", str(venv_dir)], check=True, timeout=20)
-        tel.emit("venv_created", path=str(venv_dir))
-        log.debug(f"venv created at {venv_dir}")
-        venv_created = True
-    except Exception as exc:
-        tel.emit("venv_creation_failed", error=str(exc).replace(" ", "%20"))
-        log.warning(f"venv creation failed: {exc}")
-
-    # If venv created, run install with activation so pip installs into it.
-    if venv_created:
-        quoted = " ".join(shlex.quote(p) for p in install_cmd)
-        shell_cmd = f"source {venv_dir}/bin/activate && {quoted}"
-        final_cmd = ["/bin/sh", "-c", shell_cmd]
-        tel.emit("install_started", cmd=["sh", "-c", shell_cmd])
-    else:
-        final_cmd = install_cmd
-        tel.emit("install_started", cmd=install_cmd)
-
+    # 3. Run directly (no need for `sh -c activate`!)
     install_log = WORK_DIR / "strace_install.log"
     exit_code, timed_out, fallback_used = run_with_strace(
-        final_cmd, install_log, log, tel,
+        install_cmd, install_log, log, tel,
         phase="install", timeout=INSTALL_TIMEOUT,
     )
+
+    # ==========================================
+    # NEW: ACTUALLY SEND THE LOGS TO THE HOST!
+    # ==========================================
+    if install_log.exists():
+        log.debug(f"Streaming install strace logs to host...")
+        with install_log.open("r", errors="replace") as f:
+            for line in f:
+                log.raw_strace(line, phase="install")
+    # ==========================================
 
     tel.emit("install_done", exit_code=exit_code)
     tel.emit("install_outcome", exit_code=exit_code, timed_out=timed_out, fallback=fallback_used)
@@ -805,6 +831,16 @@ def phase_execution_probes(
             cmd, probe_log, log, tel,
             phase="exec", timeout=PROBE_TIMEOUT,
         )
+        
+        # ==========================================
+        # NEW: SEND THE EXECUTION LOGS TO THE HOST!
+        # ==========================================
+        if probe_log.exists():
+            with probe_log.open("r", errors="replace") as f:
+                for line in f:
+                    log.raw_strace(line, phase=f"exec_{count}")
+        # ==========================================
+
         tel.emit("exec_done", cmd=cmd, exit_code=exit_code)
         tel.emit("exec_outcome", exit_code=exit_code, timed_out=timed_out, fallback=fallback_used)
         count += 1
@@ -882,6 +918,7 @@ def main() -> None:
     print("[agent] started, waiting for job on port 7000", flush=True)
     
     # Receive job header and artifact
+    
     header, actual_sha256, bytes_received = receive_job()
     
     job_id: str = header.get("job_id", "unknown")
@@ -889,6 +926,9 @@ def main() -> None:
     package: str = header.get("package", "")
     expected_sha256: str = header.get("artifact_sha256", "")
     artifact_size: int = int(header.get("artifact_size", 0))
+    
+    # NEW: Extract the real filename sent by the host
+    artifact_name: str = header.get("artifact_name", "artifact.pkg")
 
     print(f"[agent] job received: id={job_id} type={job_type} pkg={package}", flush=True)
 
@@ -956,14 +996,15 @@ def main() -> None:
                 tel.emit("artifact_hash_mismatch", expected=expected_sha256, actual=actual_sha256)
             else:
                 tel.emit("artifact_received", size=bytes_received, sha256=actual_sha256)
-            # Try to normalize artifact filename to a sensible extension so
-            # pip/npm can consume it directly (e.g. .whl, .zip, .tar.gz).
-            ext = detect_and_normalize_artifact(ARTIFACT_PATH)
-            if ext:
-                tel.emit("artifact_normalized", ext=ext)
-                log.debug(f"artifact renamed to have ext={ext}")
-            else:
-                log.debug("artifact normalization skipped or unknown type")
+            
+            # NEW: Just rename it directly to what the host told us it is
+            global ARTIFACT_PATH
+            new_path = ARTIFACT_PATH.with_name(artifact_name)
+            ARTIFACT_PATH.replace(new_path)
+            ARTIFACT_PATH = new_path
+            
+            tel.emit("artifact_normalized", ext=new_path.suffix, path=str(new_path))
+            log.debug(f"artifact renamed using host metadata to path={new_path}")
         else:
             WORK_DIR.mkdir(parents=True, exist_ok=True)
             tel.emit("artifact_received", size=0, note="no_artifact_install_from_registry")
