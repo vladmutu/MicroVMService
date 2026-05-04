@@ -360,6 +360,38 @@ class StdioRouter:
 
 
 # ---------------------------------------------------------------------------
+# Network readiness check
+# ---------------------------------------------------------------------------
+
+def _wait_for_network(log: "LogStream", tel: "Telemetry", timeout: int = 30) -> bool:
+    """
+    Poll outbound TCP connectivity to 1.1.1.1:443 (no DNS required).
+    Returns True once reachable, False if timeout expires.
+    On failure the agent continues in degraded mode — strace data is still valid.
+    """
+    import socket as _socket
+    deadline = time.time() + timeout
+    attempt = 0
+    start = time.time()
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(("1.1.1.1", 443))
+            elapsed = f"{time.time() - start:.2f}"
+            tel.emit("network_ok", attempt=attempt, elapsed=elapsed)
+            log.debug(f"network_ok attempt={attempt} elapsed={elapsed}s")
+            return True
+        except OSError:
+            pass
+        time.sleep(2)
+    tel.emit("network_failed", attempts=attempt, timeout=timeout)
+    log.warning(f"network_unavailable after {attempt} attempt(s) — pip/npm dependency downloads will fail")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Ingress: receive framed job over vsock 7000
 # ---------------------------------------------------------------------------
 
@@ -589,6 +621,9 @@ def run_with_strace(
         if proc.stdout:
             for line in proc.stdout:
                 output_buffer.append(line)
+                stripped = line.strip()
+                if stripped:
+                    log.stdout_line(stripped, phase=phase)
 
     t = threading.Thread(target=collect_output, daemon=True)
     t.start()
@@ -619,11 +654,6 @@ def run_with_strace(
     tailer.join(timeout=3.0)
 
     combined_output = "".join(output_buffer)
-    if combined_output.strip():
-        log.debug("--- COMMAND OUTPUT ---")
-        for line in combined_output.splitlines():
-            log.debug(f"CMD_OUTPUT: {line}")
-        log.debug("----------------------")
 
     # Check if syscall filter failed
     if "invalid system call" in combined_output:
@@ -648,8 +678,11 @@ def run_with_strace(
 
         def _drain_fallback():
             if proc.stdout:
-                for _ in proc.stdout:
-                    pass
+                for line in proc.stdout:
+                    output_buffer.append(line)
+                    stripped = line.strip()
+                    if stripped:
+                        log.stdout_line(stripped, phase=phase)
 
         tf = threading.Thread(target=_drain_fallback, daemon=True)
         tf.start()
@@ -972,6 +1005,9 @@ def main() -> None:
 
     log.debug(f"started job_id={job_id} type={job_type} package={package} artifact_size={artifact_size}")
     tel.emit("agent_started", job_type=job_type, package=package, artifact_size=artifact_size)
+
+    # ===== Network readiness check =====
+    _wait_for_network(log, tel, timeout=30)
 
     install_exit_code = -1
     probe_count = 0
