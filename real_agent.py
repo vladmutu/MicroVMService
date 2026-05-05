@@ -38,29 +38,40 @@ Guest ← Host protocol (port 7000)
     }
   Remainder: exactly artifact_size raw bytes.
 
-Syscalls traced (comprehensive)
---------------------------------
+Syscalls traced (high-signal only)
+------------------------------------
   Process lifecycle  : execve execveat clone fork vfork exit exit_group
-                       wait4 waitpid kill tkill tgkill
-  Network            : socket bind connect accept accept4 listen
-                       sendto recvfrom sendmsg recvmsg sendmmsg recvmmsg
-                       getsockopt setsockopt shutdown
-  File-system        : open openat creat read write pread64 pwrite64
-                       readv writev mmap munmap mprotect
-                       unlink unlinkat rename renameat renameat2
+                       kill tkill tgkill
+  Network (outbound) : socket bind connect accept accept4 listen
+                       sendto sendmsg sendmmsg
+  File-system        : unlink unlinkat rename renameat renameat2
                        chmod fchmod fchmodat chown fchown fchownat
-                       link linkat symlink symlinkat readlink readlinkat
+                       link linkat symlink symlinkat
                        mkdir mkdirat rmdir truncate ftruncate
-                       stat fstat lstat statx newfstatat access faccessat
-                       getcwd chdir fchdir
-  Credentials        : getuid geteuid getgid getegid setuid seteuid
-                       setgid setegid setresuid setresgid getresuid getresgid
-                       capget capset prctl
-  IPC / misc         : ptrace pipe pipe2 dup dup2 dup3 fcntl ioctl
-                       syslog sched_setaffinity memfd_create
+                       chdir fchdir
+  Credentials        : setresuid setresgid capget capset prctl
+  IPC / misc         : ptrace syslog sched_setaffinity memfd_create
                        inotify_add_watch inotify_init inotify_init1
-                       timerfd_create eventfd eventfd2
-  Environment        : getenv (captured from traced output / LD_PRELOAD hooks)
+
+Intentionally omitted (noise reduction)
+-----------------------------------------
+  open/openat/creat  — thousands of calls per install; write-side syscalls are sufficient
+  mmap               — dominated by shared-library mappings (10k+ calls); memfd_create retained
+  stat/fstat/lstat   — 5-15k calls per install, no malware signal
+  access/faccessat   — same as stat
+  mprotect/munmap    — shared-library loading noise
+  readlink           — path-resolution noise
+  read/write         — extremely high volume; network sends are the signal
+  wait4/waitpid      — parent bookkeeping only
+  getsockopt/setsockopt — socket tuning, not a detection signal
+  recvfrom/recvmsg   — response receipt; connect/sendto is the outbound signal
+  shutdown           — orderly close, not a detection signal
+  pipe/pipe2         — fd plumbing for subprocess wiring, no malware signal
+  dup/dup2/dup3      — same as pipe
+  fcntl              — same as pipe
+  timerfd/eventfd    — async I/O plumbing, not a detection signal
+  getuid/geteuid etc — checking own identity, not changing it
+  ioctl              — TTY/device noise
 """
 
 from __future__ import annotations
@@ -96,21 +107,24 @@ ARTIFACT_PATH: Path = WORK_DIR / "artifact.pkg"
 
 _TRACE_SYSCALLS: list[str] = [
     # --- process lifecycle ---
+    # Omitted: wait4/waitpid — parent bookkeeping, not a detection signal
     "execve", "execveat", "clone", "fork", "vfork",
-    "exit", "exit_group", "wait4", "waitpid",
+    "exit", "exit_group",
     "kill", "tkill", "tgkill",
-    # --- network ---
+    # --- network (outbound focus) ---
+    # Omitted: getsockopt/setsockopt — socket tuning, not a detection signal
+    # Omitted: recvfrom/recvmsg/recvmmsg — response receipt; connect/sendto is the signal
+    # Omitted: shutdown — orderly close, not a detection signal
     "socket", "bind", "connect", "accept", "accept4", "listen",
-    "sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg",
-    "getsockopt", "setsockopt", "shutdown",
-    # --- filesystem (structural / write operations only) ---
-    # Omitted: stat/fstat/lstat/statx/newfstatat — 5-15k calls per install, no malware signal
-    # Omitted: access/faccessat — same pattern as stat, pure noise
+    "sendto", "sendmsg", "sendmmsg",
+    # --- filesystem (write / structural operations only) ---
+    # Omitted: open/openat/creat — thousands of calls per install; write-side syscalls sufficient
+    # Omitted: mmap — 10k+ calls dominated by shared-library mappings; memfd_create retained
+    # Omitted: stat/fstat/lstat/statx/newfstatat — 5-15k calls, no malware signal
+    # Omitted: access/faccessat — same as stat
     # Omitted: mprotect/munmap — shared-library loading noise
     # Omitted: readlink/readlinkat — path-resolution noise
     # Omitted: getcwd — not useful for detection
-    "open", "openat", "creat",
-    "mmap",
     "unlink", "unlinkat",
     "rename", "renameat", "renameat2",
     "chmod", "fchmod", "fchmodat",
@@ -125,10 +139,11 @@ _TRACE_SYSCALLS: list[str] = [
     "capget", "capset", "prctl",
     # --- ipc / misc ---
     # Omitted: ioctl — TTY/device noise, almost never malware-relevant
-    "ptrace", "pipe", "pipe2", "dup", "dup2", "dup3", "fcntl",
+    # Omitted: pipe/pipe2, dup/dup2/dup3, fcntl — fd plumbing for subprocess wiring; no signal
+    # Omitted: timerfd_create, eventfd/eventfd2 — async I/O plumbing, not a detection signal
+    "ptrace",
     "syslog", "sched_setaffinity", "memfd_create",
     "inotify_add_watch", "inotify_init", "inotify_init1",
-    "timerfd_create", "eventfd", "eventfd2",
 ]
 TRACE_SYSCALLS_ARG: str = ",".join(_TRACE_SYSCALLS)
 
@@ -144,6 +159,11 @@ _BIN = {
     "npm": "/usr/bin/npm",
     "strace": "/usr/bin/strace",
 }
+
+# Maximum argument/string length captured by strace.
+# 256 is sufficient for paths, IPs, and short payloads.
+# 65535 produces enormous logs with no additional detection value.
+STRACE_STRING_LEN: int = 256
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +611,33 @@ def _run_strace_once(strace_cmd):
     )
 
 
+def _build_strace_base(log_path: Path, cmd: list[str], trace_expr: str = f"trace={TRACE_SYSCALLS_ARG}") -> list[str]:
+    """
+    Build a strace command with the project-standard flags.
+
+    Flags chosen for log volume reduction:
+      -f            follow forks (required for multi-process installs)
+      -s 256        truncate strings at 256 chars; enough for paths/IPs,
+                    avoids megabyte-scale argument dumps from -s 65535
+      -y            annotate fds with their paths (kept: high signal for file activity)
+      -yy omitted   annotates socket addresses with full protocol detail — verbose,
+                    low additional value over -y for detection purposes
+      -v omitted    expands all structures fully — produces enormous output for
+                    struct sockaddr, stat buffers, etc.; not needed for detection
+      --timestamps=unix,us  microsecond unix timestamps for ordering
+      -e <expr>     filtered syscall list (see _TRACE_SYSCALLS)
+    """
+    return [
+        _BIN["strace"],
+        "-f",
+        "-s", str(STRACE_STRING_LEN),
+        "-y",
+        "--timestamps=unix,us",
+        "-e", trace_expr,
+        "-o", str(log_path),
+    ] + cmd
+
+
 def run_with_strace(
     cmd: list[str],
     log_path: Path,
@@ -607,17 +654,7 @@ def run_with_strace(
     log.debug(f"strace_launch phase={phase} timeout={timeout}s cmd={cmd_text}")
     tel.emit("strace_launch", phase=phase, timeout=timeout, cmd=cmd_text)
 
-    base_cmd = [
-        _BIN["strace"],
-        "-f",
-        "-v",
-        "-s", "65535",
-        "-y",
-        "-yy",
-        "--timestamps=unix,us",
-        "-e", f"trace={TRACE_SYSCALLS_ARG}",
-        "-o", str(log_path),
-    ] + cmd
+    base_cmd = _build_strace_base(log_path, cmd)
 
     proc = _run_strace_once(base_cmd)
     tel.emit("strace_started", phase=phase, pid=proc.pid, log_path=str(log_path))
@@ -669,17 +706,7 @@ def run_with_strace(
         log.warning("strace syscall filter invalid — falling back to trace=all")
         tel.emit("strace_fallback_triggered", phase=phase, reason="invalid_system_call")
 
-        fallback_cmd = [
-            _BIN["strace"],
-            "-f",
-            "-v",
-            "-s", "65535",
-            "-y",
-            "-yy",
-            "--timestamps=unix,us",
-            "-e", "trace=all",
-            "-o", str(log_path),
-        ] + cmd
+        fallback_cmd = _build_strace_base(log_path, cmd, trace_expr="trace=all")
 
         tel.emit("strace_fallback_started", phase=phase, reason="invalid_system_call")
         proc = _run_strace_once(fallback_cmd)
@@ -915,10 +942,13 @@ def phase_ambient_monitor(
     log.marker("monitor", "start")
 
     monitor_log = WORK_DIR / "strace_monitor.log"
+    strace_cmd = _build_strace_base(monitor_log, []) 
+    # Replace trailing cmd placeholder with -p 1 attach syntax
     strace_cmd = [
         _BIN["strace"],
         "-f", "-p", "1",
-        "-v", "-s", "65535", "-y", "-yy",
+        "-s", str(STRACE_STRING_LEN),
+        "-y",
         "--timestamps=unix,us",
         "-e", f"trace={TRACE_SYSCALLS_ARG}",
         "-o", str(monitor_log),
@@ -1101,8 +1131,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
-    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[assignment]
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[assignment]
     print("[agent] script started", flush=True)
     try:
         main()

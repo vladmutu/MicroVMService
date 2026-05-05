@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     firecracker_binary: str = "/usr/local/bin/firecracker"
     jailer_binary: str = "/usr/local/bin/jailer"
     firecracker_workdir: str = "/tmp/dynamic-analysis"
-    firecracker_default_kernel: str = "/opt/firecracker/vmlinux"
-    firecracker_default_rootfs: str = "/opt/firecracker/rootfs.ext4"
+    firecracker_default_kernel: str = "/home/vladm/firecracker-workspace/vsock_vmlinux.bin"
+    firecracker_default_rootfs: str = "/home/vladm/firecracker-workspace/rootfs.ext4"
     firecracker_boot_args: str = (
         "console=ttyS0 reboot=k panic=1 pci=off "
         "root=/dev/vda rw rootwait init=/run_at_start/init"
@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # ── VM resources ──────────────────────────────────────────────────
     # Default to 1 vCPU to avoid guest kernel SMP/timer instability
     firecracker_vcpu_count: int = Field(default=1, gt=0, le=4)
-    firecracker_mem_mib: int = Field(default=1024, gt=128, le=4096)
+    firecracker_mem_mib: int = Field(default=1536, gt=128, le=4096)
 
     # ── CID allocation (must be unique per concurrent VM, ≥ 3) ───────
     cid_range_start: int = Field(default=3, ge=3)
