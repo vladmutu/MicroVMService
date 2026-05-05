@@ -421,20 +421,18 @@ class VMLifecycleManager:
             serve_tasks.extend(t_tasks)
             logger.info("[%s] Telemetry and log listeners started, connector tasks running", job_id)
 
-            # 7. Deliver job payload
-            await asyncio.wait_for(
-                asyncio.to_thread(
+            # 7+8. Deliver job and wait for agent to finish — single combined timeout
+            async def _deliver_then_wait() -> None:
+                await asyncio.to_thread(
                     self._deliver_job, workspace, job_id, job_type, package_name, artifact_bytes, artifact_name
-                ),
-                timeout=self._settings.vm_ingress_timeout_seconds,
-            )
-            logger.info("[%s] Job delivered to guest", job_id)
+                )
+                logger.info("[%s] Job delivered to guest", job_id)
+                logger.info("[%s] Waiting for agent to finish (max %ds)...", job_id, self._settings.vm_analysis_timeout_seconds)
+                await finished_signal.wait()
 
-            # 8. Wait for agent_finished signal
-            logger.info("[%s] Waiting for agent to finish (max %ds)...", job_id, self._settings.vm_analysis_timeout_seconds)
             try:
                 await asyncio.wait_for(
-                    finished_signal.wait(),
+                    _deliver_then_wait(),
                     timeout=self._settings.vm_analysis_timeout_seconds,
                 )
             except asyncio.TimeoutError:
@@ -747,7 +745,7 @@ class VMLifecycleManager:
             "artifact_name": artifact_name,
         }
 
-        deadline = time.monotonic() + self._settings.vm_ingress_timeout_seconds
+        deadline = time.monotonic() + self._settings.vm_analysis_timeout_seconds + 30
         # Give the agent a moment to start listening
         time.sleep(self._settings.vm_ingress_grace_seconds)
 
@@ -772,7 +770,7 @@ class VMLifecycleManager:
         artifact_bytes: bytes,
     ) -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(self._settings.vm_ingress_timeout_seconds)
+            sock.settimeout(30.0)
             sock.connect(str(workspace.vsock_socket))
 
             # Vsock proxy handshake

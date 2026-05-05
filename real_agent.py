@@ -103,27 +103,29 @@ _TRACE_SYSCALLS: list[str] = [
     "socket", "bind", "connect", "accept", "accept4", "listen",
     "sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg",
     "getsockopt", "setsockopt", "shutdown",
-    # --- filesystem ---
+    # --- filesystem (structural / write operations only) ---
+    # Omitted: stat/fstat/lstat/statx/newfstatat — 5-15k calls per install, no malware signal
+    # Omitted: access/faccessat — same pattern as stat, pure noise
+    # Omitted: mprotect/munmap — shared-library loading noise
+    # Omitted: readlink/readlinkat — path-resolution noise
+    # Omitted: getcwd — not useful for detection
     "open", "openat", "creat",
-    # REMOVED: "read", "write", "pread64", "pwrite64", "readv", "writev",
-    "mmap", "munmap", "mprotect",
+    "mmap",
     "unlink", "unlinkat",
     "rename", "renameat", "renameat2",
     "chmod", "fchmod", "fchmodat",
     "chown", "fchown", "fchownat",
     "link", "linkat", "symlink", "symlinkat",
-    "readlink", "readlinkat",
     "mkdir", "mkdirat", "rmdir",
     "truncate", "ftruncate",
-    "stat", "fstat", "lstat", "statx", "newfstatat",
-    "access", "faccessat",
-    "getcwd", "chdir", "fchdir",
+    "chdir", "fchdir",
     # --- credentials ---
-    "getuid", "geteuid", "getgid", "getegid",
+    # Omitted: getuid/geteuid/getgid/getegid — checking own identity, not changing it
     "setresuid", "setresgid",
     "capget", "capset", "prctl",
     # --- ipc / misc ---
-    "ptrace", "pipe", "pipe2", "dup", "dup2", "dup3", "fcntl", "ioctl",
+    # Omitted: ioctl — TTY/device noise, almost never malware-relevant
+    "ptrace", "pipe", "pipe2", "dup", "dup2", "dup3", "fcntl",
     "syslog", "sched_setaffinity", "memfd_create",
     "inotify_add_watch", "inotify_init", "inotify_init1",
     "timerfd_create", "eventfd", "eventfd2",

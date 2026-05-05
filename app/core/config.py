@@ -46,9 +46,8 @@ class Settings(BaseSettings):
 
     # ── VM lifecycle timeouts ─────────────────────────────────────────
     vm_boot_timeout_seconds: float = Field(default=250.0, gt=1.0, le=300.0)
-    vm_ingress_timeout_seconds: float = Field(default=300.0, gt=1.0, le=600.0)
     vm_ingress_grace_seconds: float = Field(default=2.0, ge=0.0, le=15.0)
-    vm_analysis_timeout_seconds: float = Field(default=300.0, gt=1.0, le=600.0)
+    vm_analysis_timeout_seconds: float = Field(default=600.0, gt=1.0, le=3600.0)
     vm_teardown_timeout_seconds: float = Field(default=100.0, gt=0.5, le=600.0)
 
     # ── Vsock port assignments ────────────────────────────────────────
