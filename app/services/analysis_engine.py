@@ -158,6 +158,7 @@ class AnalysisEngine:
                         "dns_iocs": ev.dns_iocs,
                         "crypto_iocs": ev.crypto_iocs,
                         "raw_line_count": ev.raw_line_count,
+                        "risk_score": ev.risk_score,
                     }
                 else:
                     evidence = {}

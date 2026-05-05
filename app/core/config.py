@@ -45,11 +45,11 @@ class Settings(BaseSettings):
     cid_range_end: int = Field(default=100, ge=4)
 
     # ── VM lifecycle timeouts ─────────────────────────────────────────
-    vm_boot_timeout_seconds: float = Field(default=15.0, gt=1.0, le=60.0)
-    vm_ingress_timeout_seconds: float = Field(default=10.0, gt=1.0, le=60.0)
+    vm_boot_timeout_seconds: float = Field(default=250.0, gt=1.0, le=300.0)
+    vm_ingress_timeout_seconds: float = Field(default=300.0, gt=1.0, le=600.0)
     vm_ingress_grace_seconds: float = Field(default=2.0, ge=0.0, le=15.0)
-    vm_analysis_timeout_seconds: float = Field(default=180.0, gt=1.0, le=600.0)
-    vm_teardown_timeout_seconds: float = Field(default=5.0, gt=0.5, le=30.0)
+    vm_analysis_timeout_seconds: float = Field(default=300.0, gt=1.0, le=600.0)
+    vm_teardown_timeout_seconds: float = Field(default=100.0, gt=0.5, le=600.0)
 
     # ── Vsock port assignments ────────────────────────────────────────
     vsock_ingress_port: int = Field(default=7000, gt=0, le=65535)

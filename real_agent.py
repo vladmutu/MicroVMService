@@ -132,8 +132,8 @@ TRACE_SYSCALLS_ARG: str = ",".join(_TRACE_SYSCALLS)
 
 # Timeouts (seconds)
 INSTALL_TIMEOUT: int = 90
-PROBE_TIMEOUT: int = 60
-MONITOR_DURATION: int = 45
+PROBE_TIMEOUT: int = 40
+MONITOR_DURATION: int = 30
 
 _BIN = {
     "python": "/usr/bin/python3",
@@ -486,7 +486,13 @@ def receive_job() -> tuple[dict[str, Any], str, int]:
     actual_sha256 = hasher.hexdigest()
     print(f"[agent] artifact received: {bytes_received} bytes, sha256={actual_sha256}", flush=True)
 
-    # ===== CLEANUP =====
+    # ACK: host waits for this before declaring delivery successful
+    conn.settimeout(2.0)
+    try:
+        conn.sendall(b"OK 7000\n")
+    except Exception:
+        pass
+
     # Drain any extra bytes
     conn.settimeout(0.3)
     try:
@@ -752,8 +758,9 @@ def build_install_command(job_type: str, package: str, has_artifact: bool) -> li
             return [_BIN["pip"], "install", "--no-cache-dir", target]
         return [_BIN["pip"], "install", "--no-cache-dir", package]
 
+    npm_project = WORK_DIR / "npm-project"
     target = str(ARTIFACT_PATH) if has_artifact else package
-    return [_BIN["npm"], "install", "--no-fund", "--no-audit", target]
+    return [_BIN["npm"], "install", "--no-fund", "--no-audit", "--prefix", str(npm_project), target]
 
 
 # ---------------------------------------------------------------------------
@@ -770,15 +777,16 @@ def find_entry_points(job_type: str, package: str) -> list[list[str]]:
         cmds.append([_BIN["python"], "-m", safe])
 
     elif job_type == "npm":
-        # We no longer extract npm artifacts. Prefer simple runtime probes by
-        # attempting to require the installed package by name (if provided).
-        name = package.split("@")[0].split("==")[0]
-        safe = re.sub(r"[^a-zA-Z0-9_\-@/\\.]", "_", name)
+        # Handle scoped (@org/pkg) and plain package names
+        raw = package.split("@")[0] if not package.startswith("@") else package.rsplit("@", 1)[0]
+        name = raw or package.split("@")[-1]
+        safe = re.sub(r"[^a-zA-Z0-9_\-@/]", "_", name)
+        npm_project = WORK_DIR / "npm-project"
+        mod_path = str(npm_project / "node_modules" / safe)
         if safe:
-            # Try a lightweight require check
-            cmds.append([_BIN["node"], "-e", f"require('{safe}'); console.log('require_ok')"]) 
-            # Also try executing package as a module
-            cmds.append([_BIN["node"], "-e", f"(async()=>{{try{{const m=require('{safe}'); if(m && m.main) console.log('has_main');}}catch(e){{}}}})();"])
+            cmds.append([_BIN["node"], "-e", f"require('{mod_path}'); console.log('require_ok')"])
+            cmds.append([_BIN["node"], "-e",
+                         f"try{{const m=require('{mod_path}');if(typeof m==='function')m();console.log('exec_ok')}}catch(e){{console.log('exec_attempted')}}"])
 
     return cmds
 
@@ -821,6 +829,20 @@ def phase_install(
         except Exception as exc:
             tel.emit("venv_creation_failed", error=str(exc).replace(" ", "%20"))
             log.warning(f"venv creation failed: {exc}")
+
+    # 1b. Create npm project directory (if npm)
+    if job_type == "npm":
+        npm_project_dir = WORK_DIR / "npm-project"
+        try:
+            npm_project_dir.mkdir(parents=True, exist_ok=True)
+            pkg_json = npm_project_dir / "package.json"
+            if not pkg_json.exists():
+                pkg_json.write_text('{"name":"analysis","version":"1.0.0","private":true}')
+            tel.emit("npm_project_created", path=str(npm_project_dir))
+            log.debug(f"npm project dir ready at {npm_project_dir}")
+        except Exception as exc:
+            tel.emit("npm_project_failed", error=str(exc).replace(" ", "%20"))
+            log.warning(f"npm project setup failed: {exc}")
 
     # 2. NOW build the install command (it will use the updated _BIN["pip"])
     install_cmd = build_install_command(job_type, package, has_artifact)
@@ -1044,7 +1066,13 @@ def main() -> None:
         install_exit_code = phase_install(job_type, package, has_artifact, log, tel)
 
         # ===== Phase 3: Execution probes =====
-        probe_count = phase_execution_probes(job_type, package, log, tel)
+        # Skip exec probes if install failed — nothing to execute and postinstall
+        # activity is already captured by the install strace.
+        if install_exit_code == 0:
+            probe_count = phase_execution_probes(job_type, package, log, tel)
+        else:
+            log.debug(f"phase_exec_probes_skipped install_exit_code={install_exit_code}")
+            tel.emit("exec_probes_skipped", reason="install_failed", install_exit_code=install_exit_code)
 
         # ===== Phase 4: Ambient monitoring =====
         phase_ambient_monitor(log, tel)

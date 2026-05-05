@@ -167,6 +167,42 @@ class PostgresPersistence:
             datetime.now(UTC),
         )
 
+    async def write_pip_output(self, job_id: str, phase: str, line: str) -> None:
+        """Store a single pip/npm stdout line from STDOUT:<phase>|<line>."""
+        if self._pool is None:
+            return
+        await self._pool.execute(
+            """
+            INSERT INTO analysis_pip_output (job_id, observed_at, phase, line)
+            VALUES ($1, $2, $3, $4)
+            """,
+            job_id, datetime.now(UTC), phase, line,
+        )
+
+    async def write_ioc_event(
+        self,
+        job_id: str,
+        phase: str,
+        category: str,
+        subcategory: str,
+        score: int,
+        detail: dict,
+        raw_line: str,
+    ) -> None:
+        """Store a structured IOC hit with full context for later querying."""
+        if self._pool is None:
+            return
+        await self._pool.execute(
+            """
+            INSERT INTO analysis_ioc_events
+                (job_id, observed_at, phase, category, subcategory, score_contribution, detail, raw_line)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+            """,
+            job_id, datetime.now(UTC), phase, category, subcategory, score,
+            json.dumps(detail, separators=(",", ":")),
+            raw_line,
+        )
+
     async def write_relevant_runtime_events(
         self,
         job_id: str,
@@ -242,6 +278,40 @@ class PostgresPersistence:
             "SELECT * FROM analysis_verdicts WHERE job_id = $1", job_id,
         )
         return dict(row) if row else None
+
+    async def get_pip_output(self, job_id: str) -> list[dict[str, str]]:
+        if self._pool is None:
+            return []
+        rows = await self._pool.fetch(
+            "SELECT observed_at, phase, line FROM analysis_pip_output WHERE job_id = $1 ORDER BY id",
+            job_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_ioc_events(self, job_id: str) -> list[dict[str, Any]]:
+        if self._pool is None:
+            return []
+        rows = await self._pool.fetch(
+            """SELECT phase, category, subcategory, score_contribution, detail, raw_line
+               FROM analysis_ioc_events WHERE job_id = $1 ORDER BY id""",
+            job_id,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_package_history(
+        self, ecosystem: str, package_name: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return prior analysis results for the same package (reputation lookup)."""
+        if self._pool is None:
+            return []
+        rows = await self._pool.fetch(
+            """SELECT job_id, package_version, status, verdict, risk_score, created_at
+               FROM analysis_jobs
+               WHERE ecosystem = $1 AND package_name = $2 AND status = 'completed'
+               ORDER BY created_at DESC LIMIT $3""",
+            ecosystem, package_name, limit,
+        )
+        return [dict(row) for row in rows]
 
     # ── Schema ────────────────────────────────────────────────────────
 
@@ -333,6 +403,53 @@ class PostgresPersistence:
 
         await self._pool.execute("""
             CREATE INDEX IF NOT EXISTS idx_suspicious_lines_job_id ON analysis_suspicious_lines(job_id)
+        """)
+
+        # pip/npm stdout output — stored separately from raw strace
+        await self._pool.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_pip_output (
+                id BIGSERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL REFERENCES analysis_jobs(job_id),
+                observed_at TIMESTAMPTZ NOT NULL,
+                phase TEXT NOT NULL,
+                line TEXT NOT NULL
+            )
+        """)
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pip_output_job_id ON analysis_pip_output(job_id)
+        """)
+
+        # Structured IOC events with score contributions
+        await self._pool.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_ioc_events (
+                id BIGSERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL REFERENCES analysis_jobs(job_id),
+                observed_at TIMESTAMPTZ NOT NULL,
+                phase TEXT NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT NOT NULL,
+                score_contribution INTEGER NOT NULL DEFAULT 0,
+                detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+                raw_line TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ioc_events_job_id ON analysis_ioc_events(job_id)
+        """)
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ioc_events_category ON analysis_ioc_events(category)
+        """)
+
+        # Query-friendly indexes on analysis_jobs
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_package
+                ON analysis_jobs(ecosystem, package_name)
+        """)
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_verdict ON analysis_jobs(verdict)
+        """)
+        await self._pool.execute("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_risk_score ON analysis_jobs(risk_score DESC NULLS LAST)
         """)
 
         logger.info("PostgreSQL schema verified")

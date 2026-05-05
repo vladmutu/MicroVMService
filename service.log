@@ -1,0 +1,13 @@
+INFO:     Started server process [12197]
+INFO:     Waiting for application startup.
+2026-05-04 13:10:14,813 INFO     app.main — Starting dynamic-analysis-service (env=dev)
+2026-05-04 13:10:14,968 INFO     app.services.persistence — PostgreSQL schema verified
+2026-05-04 13:10:14,968 INFO     app.services.persistence — PostgreSQL persistence initialized
+2026-05-04 13:10:14,968 INFO     app.main — Ready — max_concurrent_vms=2, cid_range=[3..20], tap=enabled
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8080): address already in use
+INFO:     Waiting for application shutdown.
+2026-05-04 13:10:14,968 INFO     app.main — Shutting down…
+2026-05-04 13:10:14,972 INFO     app.services.persistence — PostgreSQL connection pool closed
+2026-05-04 13:10:14,972 INFO     app.main — Shutdown complete
+INFO:     Application shutdown complete.

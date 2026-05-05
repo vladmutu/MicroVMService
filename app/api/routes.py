@@ -231,3 +231,45 @@ async def job_logs(job_id: str, request: Request) -> JobLogsResponse:
 @router.get("/analyze/{job_id}/logs", response_model=JobLogsResponse, dependencies=[Depends(optional_bearer_auth)])
 async def analyze_job_logs(job_id: str, request: Request) -> JobLogsResponse:
     return await job_logs(job_id, request)
+
+
+# ── Per-job pip output ────────────────────────────────────────────────
+
+@router.get("/jobs/{job_id}/pip-output", dependencies=[Depends(optional_bearer_auth)])
+async def job_pip_output(job_id: str, request: Request) -> dict:
+    """Return pip/npm stdout lines captured during the analysis."""
+    persistence = getattr(request.app.state, "persistence", None)
+    if persistence is None:
+        raise HTTPException(status_code=503, detail="Persistence not initialized")
+    rows = await persistence.get_pip_output(job_id)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job_id": job_id, "lines": rows}
+
+
+# ── Per-job IOC events ────────────────────────────────────────────────
+
+@router.get("/jobs/{job_id}/ioc-events", dependencies=[Depends(optional_bearer_auth)])
+async def job_ioc_events(job_id: str, request: Request) -> dict:
+    """Return structured IOC events detected during analysis with score contributions."""
+    persistence = getattr(request.app.state, "persistence", None)
+    if persistence is None:
+        raise HTTPException(status_code=503, detail="Persistence not initialized")
+    rows = await persistence.get_ioc_events(job_id)
+    total_score = sum(r.get("score_contribution", 0) for r in rows)
+    return {"job_id": job_id, "total_score": total_score, "events": rows}
+
+
+# ── Active VM slots ───────────────────────────────────────────────────
+
+@router.get("/slots")
+async def vm_slots(request: Request) -> dict:
+    """Return live IP assignments for all currently running microVMs."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        return {"active": [], "available_slots": 0}
+    lifecycle = getattr(engine, "_firecracker", None)
+    lc = getattr(lifecycle, "_lifecycle", None)
+    active = lc.active_vms if lc is not None else []
+    available = lc.available_slots if lc is not None else 0
+    return {"active": active, "available_slots": available}

@@ -16,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -29,6 +30,55 @@ from app.services.ioc_detector import DynamicIOCDetector, IOCEvidence
 from app.services.persistence import PostgresPersistence
 
 logger = logging.getLogger(__name__)
+
+
+# ─── IP Registry ─────────────────────────────────────────────────────
+
+class IPRegistry:
+    """Thread-safe registry of active VM IP assignments.
+
+    Provides a live view of which CID owns which TAP device and IP pair,
+    so operators can inspect running VMs and detect stale leaks.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: dict[int, dict[str, Any]] = {}  # cid → info
+
+    def register(
+        self,
+        cid: int,
+        job_id: str,
+        tap: str,
+        host_ip: str,
+        guest_ip: str,
+    ) -> None:
+        with self._lock:
+            self._active[cid] = {
+                "job_id": job_id,
+                "tap": tap,
+                "host_ip": host_ip,
+                "guest_ip": guest_ip,
+                "started_at": time.time(),
+            }
+
+    def release(self, cid: int) -> None:
+        with self._lock:
+            self._active.pop(cid, None)
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return a sorted list of currently active VM assignments."""
+        with self._lock:
+            return [{"cid": k, **v} for k, v in sorted(self._active.items())]
+
+    def is_ip_in_use(self, guest_ip: str) -> bool:
+        with self._lock:
+            return any(v["guest_ip"] == guest_ip for v in self._active.values())
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._active)
 
 
 # ─── CID Allocator ───────────────────────────────────────────────────
@@ -107,21 +157,21 @@ class TAPManager:
         """Create TAP device, assign IP, add iptables rules. Returns tap name."""
         tap = self.tap_name(slot)
         host_ip = self.host_ip(slot)
+        subnet = f"{self._subnet_prefix}.{slot}.0/30"
+
+        # Pre-clean: remove any stale device left by a failed teardown so setup is idempotent.
+        await self._run(["ip", "link", "set", tap, "down"], ignore_errors=True)
+        await self._run(["ip", "tuntap", "del", "dev", tap, "mode", "tap"], ignore_errors=True)
 
         cmds = [
             ["ip", "tuntap", "add", "dev", tap, "mode", "tap"],
             ["ip", "addr", "add", f"{host_ip}/30", "dev", tap],
+            # Lower MTU to reduce fragmentation risk in nested NAT setups.
+            ["ip", "link", "set", tap, "mtu", "1420"],
             ["ip", "link", "set", tap, "up"],
-            # NAT so VM can reach internet
-            ["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", self._wan_iface, "-j", "MASQUERADE"],
-            ["iptables", "-A", "FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
-            ["iptables", "-A", "FORWARD", "-i", tap, "-o", self._wan_iface, "-j", "ACCEPT"],
-            # Block VM from scanning private networks
-            ["iptables", "-I", "FORWARD", "-i", tap, "-d", "192.168.0.0/16", "-j", "DROP"],
-            ["iptables", "-I", "FORWARD", "-i", tap, "-d", "10.0.0.0/8", "-j", "DROP"],
-            ["iptables", "-I", "FORWARD", "-i", tap, "-d", "172.16.0.0/12", "-j", "DROP"],
-            # But allow the host-guest link itself
-            ["iptables", "-I", "FORWARD", "-i", tap, "-d", f"{host_ip}/30", "-j", "ACCEPT"],
+            # Disable offloads to avoid checksum/offload issues on virtio-net.
+            ["ethtool", "-K", tap, "sg", "off", "tso", "off", "gso", "off", "gro", "off", "tx", "off", "rx", "off"],
+            ["ethtool", "-K", self._wan_iface, "tx", "off"],
         ]
 
         # Enable IP forwarding
@@ -130,6 +180,46 @@ class TAPManager:
         for cmd in cmds:
             await self._run(cmd, ignore_errors=True)
 
+        # NAT so VM can reach internet; scope to this VM subnet for clean teardown.
+        await self._iptables_ensure(
+            ["-t", "nat"],
+            ["POSTROUTING", "-s", subnet, "-o", self._wan_iface, "-j", "MASQUERADE"],
+        )
+        await self._iptables_ensure(
+            [],
+            ["FORWARD", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+        )
+        await self._iptables_ensure(
+            [],
+            ["FORWARD", "-i", tap, "-o", self._wan_iface, "-j", "ACCEPT"],
+        )
+        # Block VM from scanning private networks.
+        await self._iptables_ensure([], ["FORWARD", "-i", tap, "-d", "192.168.0.0/16", "-j", "DROP"])
+        await self._iptables_ensure([], ["FORWARD", "-i", tap, "-d", "10.0.0.0/8", "-j", "DROP"])
+        await self._iptables_ensure([], ["FORWARD", "-i", tap, "-d", "172.16.0.0/12", "-j", "DROP"])
+        # But allow the host-guest /30 link itself.
+        await self._iptables_ensure([], ["FORWARD", "-i", tap, "-d", f"{host_ip}/30", "-j", "ACCEPT"])
+
+        # Clamp MSS and fill checksums for nested NAT reliability.
+        await self._iptables_ensure(
+            ["-t", "mangle"],
+            [
+                "FORWARD",
+                "-p", "tcp",
+                "--tcp-flags", "SYN,RST", "SYN",
+                "-j", "TCPMSS",
+                "--set-mss", "1200",
+            ],
+        )
+        await self._iptables_ensure(
+            ["-t", "mangle"],
+            ["POSTROUTING", "-p", "tcp", "-j", "CHECKSUM", "--checksum-fill"],
+        )
+        await self._iptables_ensure(
+            ["-t", "mangle"],
+            ["POSTROUTING", "-p", "udp", "-j", "CHECKSUM", "--checksum-fill"],
+        )
+
         logger.info("TAP %s created with host=%s/30", tap, host_ip)
         return tap
 
@@ -137,9 +227,11 @@ class TAPManager:
         """Remove TAP device and associated iptables rules."""
         tap = self.tap_name(slot)
         host_ip = self.host_ip(slot)
+        subnet = f"{self._subnet_prefix}.{slot}.0/30"
 
         # Remove iptables rules (best-effort, ignore errors)
         cleanup_cmds = [
+            ["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-o", self._wan_iface, "-j", "MASQUERADE"],
             ["iptables", "-D", "FORWARD", "-i", tap, "-d", f"{host_ip}/30", "-j", "ACCEPT"],
             ["iptables", "-D", "FORWARD", "-i", tap, "-d", "172.16.0.0/12", "-j", "DROP"],
             ["iptables", "-D", "FORWARD", "-i", tap, "-d", "10.0.0.0/8", "-j", "DROP"],
@@ -153,6 +245,14 @@ class TAPManager:
 
         logger.info("TAP %s torn down", tap)
 
+    async def _iptables_ensure(self, table_flag: list[str], rule: list[str]) -> None:
+        """Add iptables rule only if it does not already exist."""
+        check_cmd = ["iptables"] + table_flag + ["-C"] + rule
+        add_cmd = ["iptables"] + table_flag + ["-A"] + rule
+        result = await self._run_result(check_cmd)
+        if result != 0:
+            await self._run(add_cmd, ignore_errors=True)
+
     @staticmethod
     async def _run(cmd: list[str], ignore_errors: bool = False) -> None:
         proc = await asyncio.create_subprocess_exec(
@@ -163,6 +263,16 @@ class TAPManager:
         _, stderr = await proc.communicate()
         if proc.returncode != 0 and not ignore_errors:
             raise RuntimeError(f"Command failed: {' '.join(cmd)}: {stderr.decode()}")
+
+    @staticmethod
+    async def _run_result(cmd: list[str]) -> int:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+        return proc.returncode
 
 
 # ─── VM Lifecycle Manager ────────────────────────────────────────────
@@ -185,14 +295,27 @@ class VMLifecycleManager:
 
     def __init__(self, settings: Settings, persistence: PostgresPersistence | None = None) -> None:
         self._settings = settings
+        pool_size = settings.cid_range_end - settings.cid_range_start + 1
+        if settings.max_concurrent_vms > pool_size:
+            raise RuntimeError(
+                f"max_concurrent_vms={settings.max_concurrent_vms} exceeds CID pool size "
+                f"({settings.cid_range_start}–{settings.cid_range_end}, {pool_size} slots). "
+                "Increase cid_range_end or reduce max_concurrent_vms."
+            )
         self._cid_pool = CIDAllocator(settings.cid_range_start, settings.cid_range_end)
         self._tap_mgr = TAPManager(settings) if settings.tap_enabled else None
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_vms)
         self._persistence = persistence
+        self._ip_registry = IPRegistry()
 
     @property
     def available_slots(self) -> int:
         return self._cid_pool.available_count
+
+    @property
+    def active_vms(self) -> list[dict[str, Any]]:
+        """Live snapshot of running VM IP assignments."""
+        return self._ip_registry.snapshot()
 
     async def run_analysis(
         self,
@@ -200,13 +323,14 @@ class VMLifecycleManager:
         job_type: str,
         package_name: str,
         artifact_bytes: bytes,
+        artifact_name: str | None = None,
         kernel_path: str | None = None,
         rootfs_path: str | None = None,
     ) -> VMRunResult:
         """Run a complete VM analysis cycle. Blocks until the VM finishes or times out."""
         async with self._semaphore:
             return await self._run_analysis_inner(
-                job_id, job_type, package_name, artifact_bytes,
+                job_id, job_type, package_name, artifact_bytes, artifact_name,
                 kernel_path or self._settings.firecracker_default_kernel,
                 rootfs_path or self._settings.firecracker_default_rootfs,
             )
@@ -217,6 +341,7 @@ class VMLifecycleManager:
         job_type: str,
         package_name: str,
         artifact_bytes: bytes,
+        artifact_name: str | None,
         kernel_path: str,
         rootfs_path: str,
     ) -> VMRunResult:
@@ -253,6 +378,13 @@ class VMLifecycleManager:
             # 2. Setup TAP networking
             if self._tap_mgr:
                 workspace.tap_device = await self._tap_mgr.setup(slot)
+                self._ip_registry.register(
+                    cid=cid,
+                    job_id=job_id,
+                    tap=workspace.tap_device,
+                    host_ip=self._tap_mgr.host_ip(slot),
+                    guest_ip=self._tap_mgr.guest_ip(slot),
+                )
 
             # 3. Launch Firecracker
             proc = self._launch_firecracker(workspace)
@@ -287,18 +419,27 @@ class VMLifecycleManager:
                 job_id,
             )
             serve_tasks.extend(t_tasks)
+            logger.info("[%s] Telemetry and log listeners started, connector tasks running", job_id)
 
             # 7. Deliver job payload
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._deliver_job, workspace, job_id, job_type, package_name, artifact_bytes
+                    self._deliver_job, workspace, job_id, job_type, package_name, artifact_bytes, artifact_name
                 ),
                 timeout=self._settings.vm_ingress_timeout_seconds,
             )
             logger.info("[%s] Job delivered to guest", job_id)
 
             # 8. Wait for agent_finished signal
-            await finished_signal.wait()
+            logger.info("[%s] Waiting for agent to finish (max %ds)...", job_id, self._settings.vm_analysis_timeout_seconds)
+            try:
+                await asyncio.wait_for(
+                    finished_signal.wait(),
+                    timeout=self._settings.vm_analysis_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Timeout waiting for agent_finished; telemetry_events=%d, log_lines=%d", job_id, len(telemetry_events), len(log_lines))
+                raise
             logger.info("[%s] Agent finished", job_id)
 
             # 9. Build evidence
@@ -311,8 +452,8 @@ class VMLifecycleManager:
                 log_lines=log_lines,
             )
 
-        except asyncio.TimeoutError:
-            logger.warning("[%s] VM analysis timed out", job_id)
+        except asyncio.TimeoutError as exc:
+            logger.warning("[%s] VM analysis timed out.", job_id)
             evidence = detector.build_evidence()
             return VMRunResult(
                 evidence=evidence,
@@ -380,9 +521,8 @@ class VMLifecycleManager:
         if self._tap_mgr:
             guest_ip = self._tap_mgr.guest_ip(slot)
             host_ip = self._tap_mgr.host_ip(slot)
-            # Linux kernel ip= parameter: ip=client:server:gw:mask:hostname:device:autoconf
-            ip_arg = f"ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"
-            return f"{base} {ip_arg}"
+            # Custom params parsed by /run_at_start/init from /proc/cmdline
+            return f"{base} fc_ip={guest_ip} fc_gw={host_ip} fc_mask=30"
         return base
 
     # ─── Firecracker process ──────────────────────────────────────────
@@ -450,42 +590,13 @@ class VMLifecycleManager:
         job_id: str,
     ) -> tuple[asyncio.AbstractServer, asyncio.AbstractServer, list[asyncio.Task[None]]]:
 
-        async def _handle_channel(
-            reader: asyncio.StreamReader,
-            writer: asyncio.StreamWriter,
-            port: int,
-            on_line: Any,
-        ) -> None:
-            try:
-                # Vsock handshake: guest sends "CONNECT {port}\n", host replies "OK {port}\n"
-                handshake = await asyncio.wait_for(reader.readline(), timeout=30.0)
-                expected = f"CONNECT {port}".encode()
-                if not handshake.startswith(expected):
-                    logger.warning("[%s] Bad handshake on port %d: %r", job_id, port, handshake)
-                    return
-                writer.write(f"OK {port}\n".encode())
-                await writer.drain()
-
-                while True:
-                    line = await reader.readline()
-                    if not line:
-                        break
-                    text = line.decode("utf-8", errors="replace").rstrip("\n")
-                    if text:
-                        await on_line(text)
-            except asyncio.TimeoutError:
-                logger.warning("[%s] Handshake timeout on port %d", job_id, port)
-            except Exception as exc:
-                logger.error("[%s] Channel %d error: %r", job_id, port, exc)
-            finally:
-                writer.close()
-                with suppress(Exception):
-                    await writer.wait_closed()
-
         async def on_telemetry_line(text: str) -> None:
             telemetry_events.append(text)
             logger.debug("[%s][telemetry] %s", job_id, text[:200])
-            if " agent_finished " in text or " verdict " in text or text.endswith(" agent_finished") or text.endswith(" verdict"):
+            # Agent sends telemetry as: <timestamp> <job_id> <event_name> [key=value ...]
+            # Extract the event name (3rd space-delimited field)
+            parts = text.split()
+            if len(parts) >= 3 and parts[2] in ("agent_finished", "verdict"):
                 # Give a short delay to allow log_lines from vsock port 7002 to flush
                 # before setting finished_signal and tearing down the VM.
                 async def _signal() -> None:
@@ -495,100 +606,114 @@ class VMLifecycleManager:
 
         async def on_log_line(text: str) -> None:
             log_lines.append(text)
-
-            async def _persist_ioc_delta(payload_text: str, before_counts: tuple[int, int, int, int, int], after_counts: tuple[int, int, int, int, int]) -> None:
-                if not self._persistence or not any(a > b for a, b in zip(after_counts, before_counts)):
-                    return
-                categories = []
-                if after_counts[0] > before_counts[0]:
-                    categories.append("network")
-                if after_counts[1] > before_counts[1]:
-                    categories.append("process")
-                if after_counts[2] > before_counts[2]:
-                    categories.append("file")
-                if after_counts[3] > before_counts[3]:
-                    categories.append("dns")
-                if after_counts[4] > before_counts[4]:
-                    categories.append("crypto")
-                category = ",".join(categories) if categories else None
-                with suppress(Exception):
-                    await self._persistence.write_suspicious_line(job_id, payload_text, category=category)
-
-            before_counts = (
-                len(detector.network_iocs),
-                len(detector.process_iocs),
-                len(detector.file_iocs),
-                len(detector.dns_iocs),
-                len(detector.crypto_iocs),
-            )
-            
-            detector.observe_line(text)
-            
-            after_counts = (
-                len(detector.network_iocs),
-                len(detector.process_iocs),
-                len(detector.file_iocs),
-                len(detector.dns_iocs),
-                len(detector.crypto_iocs),
-            )
-            await _persist_ioc_delta(text, before_counts, after_counts)
-
             logger.debug("[%s][log] %s", job_id, text[:200])
 
-        # Ensure old vsock UDS is removed
+            if text.startswith("STDOUT:"):
+                # pip/npm install output — store in dedicated table
+                rest = text[len("STDOUT:"):]
+                phase_part, content = rest.split("|", 1) if "|" in rest else (rest, rest)
+                if self._persistence:
+                    with suppress(Exception):
+                        await self._persistence.write_pip_output(job_id, phase_part, content)
+
+            elif text.startswith(("AGENT:", "MARKER:")):
+                # Agent diagnostic messages and phase markers
+                if self._persistence:
+                    with suppress(Exception):
+                        await self._persistence.write_log(job_id, "guest", "debug", text)
+
+            else:
+                # PHASE: strace lines (and any unprefixed fallback)
+                before_ioc_count = len(detector.ioc_events)
+                detector.observe_line(text)
+
+                # Persist any newly triggered IOC events
+                if self._persistence and len(detector.ioc_events) > before_ioc_count:
+                    for ev in detector.ioc_events[before_ioc_count:]:
+                        with suppress(Exception):
+                            await self._persistence.write_ioc_event(
+                                job_id,
+                                ev.phase,
+                                ev.category,
+                                ev.subcategory,
+                                ev.score_contribution,
+                                ev.detail,
+                                ev.raw_line,
+                            )
+                        with suppress(Exception):
+                            await self._persistence.write_suspicious_line(
+                                job_id, ev.raw_line, category=ev.category
+                            )
+
+        # Ensure old vsock UDS socket files are removed (Firecracker routes to these paths)
         with suppress(FileNotFoundError):
             workspace.telemetry_socket.unlink()
         with suppress(FileNotFoundError):
             workspace.log_socket.unlink()
 
-        # Connector task: actively connect to the Firecracker vsock UDS and
-        # request a pairing for the given port (7001/7002). When paired,
-        # stream lines into the on_line handler.
-        async def _connector(port: int, on_line: Any) -> None:
-            path = str(workspace.vsock_socket)
-            backoff = 0.1
-            while True:
-                try:
-                    reader, writer = await asyncio.open_unix_connection(path)
-                    # Send CONNECT handshake as the host side
-                    writer.write(f"CONNECT {port}\n".encode())
-                    await writer.drain()
-                    # Read ack
-                    ack = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                    if not ack.startswith(f"OK {port}".encode()):
-                        writer.close()
-                        with suppress(Exception):
-                            await writer.wait_closed()
-                        await asyncio.sleep(backoff)
-                        backoff = min(2.0, backoff * 2)
-                        continue
-
-                    # Paired — reset backoff and consume lines
-                    backoff = 0.1
-                    while True:
-                        line = await reader.readline()
-                        if not line:
-                            break
-                        text = line.decode("utf-8", errors="replace").rstrip("\n")
-                        if text:
-                            await on_line(text)
+        # Create Unix socket servers for telemetry (7001) and logs (7002)
+        # Firecracker automatically routes guest vsock connections to these socket files
+        async def _handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, port: int, on_line: Any) -> None:
+            try:
+                # Read handshake: guest sends "CONNECT <port>\n"
+                handshake = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                expected = f"CONNECT {port}".encode()
+                if not handshake.startswith(expected):
+                    logger.warning("[%s] Bad handshake on port %d: %r", job_id, port, handshake)
                     writer.close()
                     with suppress(Exception):
                         await writer.wait_closed()
-                except Exception:
-                    await asyncio.sleep(backoff)
-                    backoff = min(2.0, backoff * 2)
+                    return
+                
+                # Send ack
+                writer.write(f"OK {port}\n".encode())
+                await writer.drain()
+                logger.debug("[%s] Handshake OK on port %d", job_id, port)
+                
+                # Stream lines until connection closes
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        logger.debug("[%s] Connection closed on port %d", job_id, port)
+                        break
+                    text = line.decode("utf-8", errors="replace").rstrip("\n")
+                    if text:
+                        await on_line(text)
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Handshake timeout on port %d", job_id, port)
+            except Exception as exc:
+                logger.error("[%s] Channel %d error: %s", job_id, port, exc, exc_info=True)
+            finally:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
 
-        tel_port = self._settings.vsock_telemetry_port
-        log_port = self._settings.vsock_log_port
+        # Start Unix socket servers for telemetry and logs
+        tel_server = await asyncio.start_unix_server(
+            lambda r, w: _handle_connection(r, w, self._settings.vsock_telemetry_port, on_telemetry_line),
+            path=str(workspace.telemetry_socket),
+        )
+        log_server = await asyncio.start_unix_server(
+            lambda r, w: _handle_connection(r, w, self._settings.vsock_log_port, on_log_line),
+            path=str(workspace.log_socket),
+        )
+        logger.info("[%s] Telemetry and log Unix socket servers started", job_id)
 
-        tasks = [
-            asyncio.create_task(_connector(tel_port, on_telemetry_line)),
-            asyncio.create_task(_connector(log_port, on_log_line)),
+        # Serve connections (these are background tasks that handle incoming connections)
+        async def _serve_tel() -> None:
+            async with tel_server:
+                await tel_server.serve_forever()
+
+        async def _serve_log() -> None:
+            async with log_server:
+                await log_server.serve_forever()
+
+        serve_tasks = [
+            asyncio.create_task(_serve_tel()),
+            asyncio.create_task(_serve_log()),
         ]
 
-        # We don't create separate unix servers for telemetry/logs — return None
-        return None, None, tasks
+        return tel_server, log_server, serve_tasks
 
     # ─── Job delivery (vsock port 7000) ───────────────────────────────
 
@@ -599,14 +724,27 @@ class VMLifecycleManager:
         job_type: str,
         package_name: str,
         artifact_bytes: bytes,
+        artifact_name: str | None = None,
     ) -> None:
         artifact_sha = hashlib.sha256(artifact_bytes).hexdigest() if artifact_bytes else ""
+
+        # Ensure a sensible artifact filename is provided to the guest agent.
+        if not artifact_name:
+            if job_type == "npm":
+                ext = ".tgz"
+            elif job_type == "pypi":
+                ext = ".zip"
+            else:
+                ext = ".pkg"
+            artifact_name = f"{package_name}{ext}"
+
         payload = {
             "job_id": job_id,
             "job_type": job_type,
             "package": package_name,
             "artifact_size": len(artifact_bytes),
             "artifact_sha256": artifact_sha,
+            "artifact_name": artifact_name,
         }
 
         deadline = time.monotonic() + self._settings.vm_ingress_timeout_seconds
@@ -695,6 +833,7 @@ class VMLifecycleManager:
         if self._tap_mgr:
             with suppress(Exception):
                 await self._tap_mgr.teardown(slot)
+        self._ip_registry.release(cid)
 
         # 6. Release CID back to pool
         await self._cid_pool.release(cid)

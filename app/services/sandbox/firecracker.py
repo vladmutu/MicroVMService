@@ -39,11 +39,20 @@ class FirecrackerSandboxRunner(SandboxRunner):
             else self._settings.firecracker_default_rootfs
         )
 
+        # Derive a filename for the artifact from the resolved package URL when available
+        artifact_name = None
+        try:
+            from pathlib import Path
+            artifact_name = Path(package.download_url).name if getattr(package, "download_url", None) else None
+        except Exception:
+            artifact_name = None
+
         result = await self._lifecycle.run_analysis(
             job_id=job_id or "unknown",
             job_type=request.ecosystem,
             package_name=request.package_name,
             artifact_bytes=package.artifact_bytes,
+            artifact_name=artifact_name,
             kernel_path=kernel,
             rootfs_path=rootfs,
         )
@@ -61,11 +70,15 @@ class FirecrackerSandboxRunner(SandboxRunner):
 
         destinations: list[str] = []
         for ioc in ev.network_iocs:
-            # Extract IP/port from "public_ip:1.2.3.4" or "suspicious_port:4444"
-            if ioc.startswith("public_ip:"):
-                destinations.append(ioc.removeprefix("public_ip:"))
+            if ioc.startswith("external_ip:"):
+                destinations.append(ioc.removeprefix("external_ip:"))
             elif ioc.startswith("suspicious_port:"):
-                destinations.append(f"*:{ioc.removeprefix('suspicious_port:')}")
+                # format: "suspicious_port:<port>:<ip>"
+                parts = ioc.split(":")
+                dest = f"{parts[2]}:{parts[1]}" if len(parts) >= 3 else parts[-1]
+                destinations.append(dest)
+            elif ioc.startswith("raw_socket"):
+                destinations.append("raw_socket")
 
         write_paths = [
             ioc.removeprefix("sensitive_file:")
