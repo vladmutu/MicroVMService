@@ -65,6 +65,7 @@ class IOCDetail(BaseModel):
     dns_iocs: list[str] = Field(default_factory=list)
     crypto_iocs: list[str] = Field(default_factory=list)
     raw_line_count: int = 0
+    flagged_lines: list[str] = Field(default_factory=list)
 
 
 class AnalyzeResponse(BaseModel):

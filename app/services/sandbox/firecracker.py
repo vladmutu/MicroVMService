@@ -39,13 +39,16 @@ class FirecrackerSandboxRunner(SandboxRunner):
             else self._settings.firecracker_default_rootfs
         )
 
-        # Derive a filename for the artifact from the resolved package URL when available
-        artifact_name = None
-        try:
-            from pathlib import Path
-            artifact_name = Path(package.download_url).name if getattr(package, "download_url", None) else None
-        except Exception:
-            artifact_name = None
+        # Prefer the explicit filename from local uploads; fall back to URL-derived name
+        artifact_name = getattr(package, "artifact_filename", None)
+        if not artifact_name:
+            try:
+                from pathlib import Path
+                url = getattr(package, "download_url", None)
+                if url and url != "local-upload":
+                    artifact_name = Path(url).name or None
+            except Exception:
+                artifact_name = None
 
         result = await self._lifecycle.run_analysis(
             job_id=job_id or "unknown",

@@ -4,7 +4,10 @@
       "Bash(Get-ChildItem -Path e:\\\\Licenta\\\\MicroVMService -File -Filter \"*.py\" -Exclude \".venv\" -Recurse)",
       "Bash(Select-Object -First 30 FullName)",
       "Bash(Get-ChildItem -Path \"e:\\\\Licenta\\\\MicroVMService\\\\app\" -Recurse -Filter \"*.py\" -File)",
-      "Bash(Select-Object FullName)"
+      "Bash(Select-Object FullName)",
+      "Bash(Get-ChildItem -Path . -Recurse)",
+      "Bash(Select-Object -Property FullName)",
+      "Bash(python -c ' *)"
     ]
   }
 }

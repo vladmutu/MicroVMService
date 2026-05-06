@@ -85,6 +85,7 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
                 dns_iocs=outcome.evidence.get("dns_iocs", []),
                 crypto_iocs=outcome.evidence.get("crypto_iocs", []),
                 raw_line_count=outcome.evidence.get("raw_line_count", 0),
+                flagged_lines=outcome.evidence.get("flagged_lines", []),
             )
 
         return AnalyzeResponse(
@@ -128,11 +129,11 @@ async def analyze_upload(
     request: Request,
     ecosystem: Literal["npm", "pypi"] = Form(...),
     package_name: str = Form(...),
-    package_version: str = Form(...),
+    package_version: str = Form(default="unknown"),
     sandbox_type: Literal["generic", "firecracker"] = Form(...),
     file: UploadFile = File(...),
 ) -> AnalyzeResponse:
-    """Analyze a locally uploaded package archive."""
+    """Analyze a locally uploaded package archive (supports .whl, .tar.gz, .zip, .tgz)."""
     engine = _get_engine(request)
     settings = get_settings()
 
@@ -144,11 +145,12 @@ async def analyze_upload(
     )
 
     artifact_bytes = await file.read()
+    artifact_filename = file.filename or None
 
     started = time.perf_counter()
     IN_FLIGHT.inc()
     try:
-        outcome = await engine.analyze(body, artifact_bytes=artifact_bytes)
+        outcome = await engine.analyze(body, artifact_bytes=artifact_bytes, artifact_filename=artifact_filename)
         REQUEST_COUNTER.labels(body.ecosystem, body.sandbox_type, outcome.status).inc()
 
         telemetry = outcome.telemetry
@@ -165,6 +167,7 @@ async def analyze_upload(
                 dns_iocs=outcome.evidence.get("dns_iocs", []),
                 crypto_iocs=outcome.evidence.get("crypto_iocs", []),
                 raw_line_count=outcome.evidence.get("raw_line_count", 0),
+                flagged_lines=outcome.evidence.get("flagged_lines", []),
             )
 
         return AnalyzeResponse(

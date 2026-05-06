@@ -68,7 +68,7 @@ class AnalysisEngine:
         # This ensures the same package analyzed multiple times gets different job_ids
         return str(uuid.uuid4())
 
-    async def analyze(self, request: AnalyzeRequest, artifact_bytes: bytes | None = None) -> AnalysisOutcome:
+    async def analyze(self, request: AnalyzeRequest, artifact_bytes: bytes | None = None, artifact_filename: str | None = None) -> AnalysisOutcome:
         job_id = self.build_job_id(request)
 
         # Create job record in PostgreSQL
@@ -81,7 +81,7 @@ class AnalysisEngine:
         )
 
         try:
-            outcome = await self._analyze_inner(request, job_id, artifact_bytes)
+            outcome = await self._analyze_inner(request, job_id, artifact_bytes, artifact_filename)
         except (asyncio.TimeoutError, TimeoutError):
             telemetry = Telemetry(timed_out=True).normalized()
             await self._persistence.write_log(job_id, "host", "warning", "analysis timed out")
@@ -98,7 +98,7 @@ class AnalysisEngine:
 
         return outcome
 
-    async def _analyze_inner(self, request: AnalyzeRequest, job_id: str, artifact_bytes: bytes | None = None) -> AnalysisOutcome:
+    async def _analyze_inner(self, request: AnalyzeRequest, job_id: str, artifact_bytes: bytes | None = None, artifact_filename: str | None = None) -> AnalysisOutcome:
         await self._persistence.write_log(
             job_id, "host", "info",
             f"analysis started for {request.ecosystem}:{request.package_name}:{request.package_version}",
@@ -115,6 +115,7 @@ class AnalysisEngine:
                     download_url="local-upload",
                     expected_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
                     artifact_bytes=artifact_bytes,
+                    artifact_filename=artifact_filename,
                 )
             else:
                 package = await self._resolver.resolve(
@@ -159,6 +160,7 @@ class AnalysisEngine:
                         "crypto_iocs": ev.crypto_iocs,
                         "raw_line_count": ev.raw_line_count,
                         "risk_score": ev.risk_score,
+                        "flagged_lines": [e.raw_line for e in ev.ioc_events if e.raw_line],
                     }
                 else:
                     evidence = {}

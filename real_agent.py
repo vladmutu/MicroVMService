@@ -776,19 +776,52 @@ def _find_npm_pkg_dir() -> Path:
     return pkg_jsons[0].parent if pkg_jsons else EXTRACT_DIR / "package"
 
 
+def _extract_npm_zip(artifact_path: Path) -> Path:
+    """Extract a .zip archive for npm installation.
+
+    npm cannot install .zip directly. Extract to a temp dir and return:
+    - the directory containing package.json (shallowest), or
+    - a .tgz/.tar.gz found inside the zip, or
+    - the extraction root as fallback.
+    """
+    extract_dir = WORK_DIR / "npm_extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(str(artifact_path)) as zf:
+        zf.extractall(str(extract_dir))
+
+    # Prefer the shallowest package.json (= package root directory)
+    pkg_jsons = sorted(extract_dir.rglob("package.json"), key=lambda p: len(p.parts))
+    if pkg_jsons:
+        return pkg_jsons[0].parent
+
+    # If the zip wraps a tarball, install from the tarball
+    tarballs = sorted(
+        list(extract_dir.rglob("*.tgz")) + list(extract_dir.rglob("*.tar.gz")),
+        key=lambda p: len(p.parts),
+    )
+    if tarballs:
+        return tarballs[0]
+
+    return extract_dir
+
+
 def build_install_command(job_type: str, package: str, has_artifact: bool) -> list[str]:
     """Build the install command for pip or npm."""
     if job_type == "pypi":
         if has_artifact:
-            target = str(ARTIFACT_PATH)
-            if ARTIFACT_PATH.suffix == ".whl":
-                # Removed --no-index so it fetches dependencies!
-                return [_BIN["pip"], "install", "--no-cache-dir", target]
-            return [_BIN["pip"], "install", "--no-cache-dir", target]
+            # pip handles .whl, .tar.gz, .zip, .tar.bz2 natively
+            return [_BIN["pip"], "install", "--no-cache-dir", str(ARTIFACT_PATH)]
         return [_BIN["pip"], "install", "--no-cache-dir", package]
 
     npm_project = WORK_DIR / "npm-project"
-    target = str(ARTIFACT_PATH) if has_artifact else package
+    if has_artifact:
+        if ARTIFACT_PATH.suffix == ".zip":
+            target = str(_extract_npm_zip(ARTIFACT_PATH))
+        else:
+            target = str(ARTIFACT_PATH)
+    else:
+        target = package
     return [_BIN["npm"], "install", "--no-fund", "--no-audit", "--prefix", str(npm_project), target]
 
 

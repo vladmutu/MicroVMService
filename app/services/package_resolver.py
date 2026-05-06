@@ -15,6 +15,7 @@ class ResolvedPackage:
     download_url: str
     expected_sha256: str | None
     artifact_bytes: bytes
+    artifact_filename: str | None = None
 
 
 class PackageResolver:

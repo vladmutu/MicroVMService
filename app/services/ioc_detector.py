@@ -56,14 +56,76 @@ _PIP_TMP_RE = re.compile(
     r"standalone|collect)-"
 )
 
-# Dynamic DNS providers — DNS queries to these during install are suspicious
-_DDNS_DOMAINS = (
-    "no-ip.com", "afraid.org", "duckdns.org", "ddns.net",
-    "dynu.com", "changeip.com", "hopto.org", "servebeer.com",
+# Analysis infrastructure paths — our own tools running inside /tmp/analysis/
+_ANALYSIS_TMP_PREFIXES: tuple[str, ...] = (
+    "/tmp/analysis/venv/",
+    "/tmp/analysis/npm-project/node_modules/",
+)
+
+# DNS label substrings expected during normal package registry operations
+_SAFE_REGISTRY_DNS: tuple[str, ...] = (
+    "pypi",         # pypi.org
+    "pythonhosted", # files.pythonhosted.org
+    "npmjs",        # registry.npmjs.org, cdn.npmjs.org
+)
+
+# System utilities that setup.py / npm install scripts should never need.
+# NOTE: uname and lsb_release are intentionally excluded — pip itself calls
+# them on every install for platform-tag detection, so they fire for every
+# package and have no discriminative value.
+_RECON_COMMANDS: frozenset[str] = frozenset({
+    "id", "whoami", "hostname", "getconf",
+})
+
+# Netlink protocols that are completely safe when used with SOCK_RAW.
+# NETLINK_ROUTE: routing/interface queries (libc getifaddrs, getaddrinfo)
+# NETLINK_SOCK_DIAG: socket diagnostics (ss, netstat)
+_SAFE_NETLINK_PROTOS: frozenset[str] = frozenset({"NETLINK_ROUTE", "NETLINK_SOCK_DIAG"})
+
+# DDNS hostname labels checked against DNS wire-format payload in sendto args_str.
+# DNS wire format uses length-prefixed labels with NO dots, so "duckdns.org" as a
+# substring would never match — we match the distinctive hostname label only.
+_DDNS_DOMAINS: tuple[str, ...] = (
+    "no-ip", "afraid", "duckdns", "ddns",
+    "dynu", "changeip", "hopto", "servebeer",
 )
 
 _PORT_RE = re.compile(r"sin_port=htons\((\d+)\)")
 _IP_RE   = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+# Paths written to during install that indicate persistence or credential theft
+_PERSIST_PATHS: tuple[str, ...] = (
+    "/.bashrc", "/.bash_profile", "/.profile", "/.zshrc",
+    "/etc/cron", "/etc/rc.local", "/etc/init.d/",
+    "/.ssh/authorized_keys", "/var/spool/cron", "crontab",
+    "/.config/autostart",
+)
+
+_SENSITIVE_READ_PATHS: tuple[str, ...] = (
+    "/.aws/", "/.ssh/", "/.gnupg/",
+    "/etc/passwd", "/etc/shadow", "/etc/sudoers",
+    "/.config/gcloud", "/.kube/config",
+    "/.npmrc", "/.pypirc",
+)
+
+# Root-level directory names that are normal system paths (not suspicious)
+_SAFE_ROOT_DIRS: frozenset[str] = frozenset({
+    "tmp", "proc", "sys", "dev", "run", "mnt", "media",
+    "home", "var", "usr", "opt", "lib", "lib64", "bin", "sbin",
+    "boot", "etc", "srv", "snap", "root",
+})
+
+# Phrases in install stdout that indicate anti-analysis / sandbox evasion
+_ANTI_ANALYSIS_PHRASES: tuple[str, ...] = (
+    "trick system", "are you running this on",
+    "sandbox detected", "vm detected", "analysis environment",
+    "virtual machine", "debugger detected",
+)
+
+# Matches "Created '/path'" or "Writing to '/path'" in package stdout
+_STDOUT_FILE_WRITE_RE = re.compile(
+    r"(?:[Cc]reated?|[Ww]riting(?: to)?)\s+['\"]?(/[^\s'\">,]+)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +196,7 @@ class DynamicIOCDetector:
         # ── State ──────────────────────────────────────────────────────
         self.written_files: set[str] = set()
         self.memfd_created: set[str] = set()
+        self.recon_seen:   set[str] = set()  # dedup recon commands across PATH-search retries
 
         # Process tree: pid → parent_pid, pid → cmdline
         self._proc_tree: dict[str, str] = {}
@@ -226,10 +289,7 @@ class DynamicIOCDetector:
 
         elif syscall == "socket":
             if "SOCK_RAW" in args_str:
-                self.raw_socket_created = True
-                self._add_ioc("network", "raw_socket",
-                              self._w(40, phase), phase, {}, raw_line)
-                self.network_iocs.append("raw_socket")
+                self._check_raw_socket(args_str, phase, raw_line)
 
         elif syscall == "sendto" and "sin_port=htons(53)" in args_str:
             self._check_dns_send(pid, args_str, phase, raw_line)
@@ -306,9 +366,21 @@ class DynamicIOCDetector:
                                   self._w(75, phase), phase, {"path": path}, raw_line)
                     self.process_iocs.append("shell_download_exec")
 
-        # Skip legitimate pip temp executions
+        # Skip legitimate pip temp executions and our own analysis infrastructure
         if _PIP_TMP_RE.match(path):
             return
+        if any(path.startswith(p) for p in _ANALYSIS_TMP_PREFIXES):
+            return
+
+        # System recon during install — dedup across PATH-search retries
+        if phase == "install":
+            cmd_name = path.rsplit("/", 1)[-1]
+            if cmd_name in _RECON_COMMANDS and cmd_name not in self.recon_seen:
+                self.recon_seen.add(cmd_name)
+                self._add_ioc("process", "system_recon",
+                              self._w(20, phase), phase,
+                              {"cmd": cmd_name}, raw_line)
+                self.process_iocs.append(f"system_recon:{cmd_name}")
 
         # Exec from /tmp (but not pip's own temp)
         if path.startswith("/tmp/"):
@@ -394,11 +466,45 @@ class DynamicIOCDetector:
                       self._w(25, phase), phase,
                       {"ip": ip, "port": port}, raw_line)
 
+    # ── raw socket analysis ───────────────────────────────────────────
+
+    def _check_raw_socket(self, args_str: str, phase: str, raw_line: str) -> None:
+        # AF_NETLINK + safe protocol: used by libc for routing/interface queries — benign
+        if "AF_NETLINK" in args_str:
+            if any(proto in args_str for proto in _SAFE_NETLINK_PROTOS):
+                return
+            # Other netlink protocols: low informational score
+            self._add_ioc("network", "netlink_raw", self._w(5, phase), phase, {}, raw_line)
+            self.network_iocs.append("netlink_raw")
+            return
+
+        # AF_PACKET: raw Ethernet frame access (sniffing / injection)
+        if "AF_PACKET" in args_str:
+            self.raw_socket_created = True
+            self._add_ioc("network", "raw_socket_packet", self._w(60, phase), phase, {}, raw_line)
+            self.network_iocs.append("raw_socket_packet")
+            return
+
+        # AF_INET / AF_INET6: raw IP packet crafting
+        if "AF_INET" in args_str:
+            self.raw_socket_created = True
+            self._add_ioc("network", "raw_socket", self._w(40, phase), phase, {}, raw_line)
+            self.network_iocs.append("raw_socket")
+            return
+
+        # Unknown family with SOCK_RAW — unusual but not definitely malicious
+        self._add_ioc("network", "raw_socket", self._w(20, phase), phase, {}, raw_line)
+        self.network_iocs.append("raw_socket")
+
     # ── DNS send analysis ─────────────────────────────────────────────
 
     def _check_dns_send(
         self, pid: str, args_str: str, phase: str, raw_line: str,
     ) -> None:
+        # DNS queries for package registry infrastructure are normal during install
+        if any(label in args_str for label in _SAFE_REGISTRY_DNS):
+            return
+
         self.dns_events.append({"phase": phase})
         self.dns_iocs.append("dns_query")
 
@@ -431,14 +537,7 @@ class DynamicIOCDetector:
         if is_write:
             self.written_files.add(path)
 
-            # Persistence paths
-            PERSIST_PATHS = (
-                "/.bashrc", "/.bash_profile", "/.profile", "/.zshrc",
-                "/etc/cron", "/etc/rc.local", "/etc/init.d/",
-                "/.ssh/authorized_keys", "/var/spool/cron", "crontab",
-                "/.config/autostart",
-            )
-            if any(p in path for p in PERSIST_PATHS):
+            if any(p in path for p in _PERSIST_PATHS):
                 ev = {"path": path}
                 self.persistence_events.append(ev)
                 self._add_ioc("file", "persistence_write", 60, phase, ev, raw_line)
@@ -449,13 +548,7 @@ class DynamicIOCDetector:
                 self.hidden_file_created = True
 
         if is_read:
-            SENSITIVE_PATHS = (
-                "/.aws/", "/.ssh/", "/.gnupg/",
-                "/etc/passwd", "/etc/shadow", "/etc/sudoers",
-                "/.config/gcloud", "/.kube/config",
-                "/.npmrc", "/.pypirc",
-            )
-            if any(p in path for p in SENSITIVE_PATHS):
+            if any(p in path for p in _SENSITIVE_READ_PATHS):
                 ev = {"path": path}
                 self.exfil_events.append(ev)
                 self._add_ioc("file", "sensitive_file_read",
@@ -487,6 +580,28 @@ class DynamicIOCDetector:
             self.reverse_shell_events.append({"type": "stdout_reverse_shell", "phase": phase})
             self._add_ioc("process", "reverse_shell_stdout", 90, phase, {}, line)
             self.process_iocs.append("reverse_shell")
+
+        # Anti-analysis / sandbox-evasion messages printed by the package
+        low = line.lower()
+        for phrase in _ANTI_ANALYSIS_PHRASES:
+            if phrase in low:
+                self._add_ioc("process", "anti_analysis_stdout",
+                              self._w(70, phase), phase, {"phrase": phrase}, line)
+                self.process_iocs.append("anti_analysis_output")
+                break
+
+        # File creation/write confirmed in stdout (e.g. malicious setup.py hooks)
+        m = _STDOUT_FILE_WRITE_RE.search(line)
+        if m:
+            path = m.group(1).rstrip("',\"")
+            top = path.lstrip("/").split("/")[0]
+            is_suspicious_root = top and top not in _SAFE_ROOT_DIRS
+            is_persist = any(p in path for p in _PERSIST_PATHS)
+            is_sensitive = any(p in path for p in _SENSITIVE_READ_PATHS)
+            if is_suspicious_root or is_persist or is_sensitive:
+                self._add_ioc("file", "stdout_sensitive_write",
+                              self._w(55, phase), phase, {"path": path}, line)
+                self.file_iocs.append(f"sensitive_file:{path}")
 
     # ── Build final evidence ──────────────────────────────────────────
 
